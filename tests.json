@@ -74,18 +74,21 @@
     {
       "id": "anchor_dataloader",
       "name": "Anchor Dataset Loading",
-      "status": "not_started",
+      "status": "passing",
       "priority": "medium",
       "description": "Test anchor dataset loading and batching",
       "file": "tests/test_anchor_cache.py",
       "test_cases": [
-        "test_anchor_dataset_creation",
-        "test_anchor_dataloader_iteration",
-        "test_anchor_batch_format"
+        "test_labels_mask_rules",
+        "test_anchor_cache_dataset_format",
+        "test_anchor_cache_dataloader",
+        "test_anchor_cache_cross_shard_access",
+        "test_labels_no_loss_on_padding"
       ],
       "dependencies": [
         "anchor_cache.py implementation"
-      ]
+      ],
+      "notes": "使用 mock 数据测试，验证 labels mask 规则和数据格式正确性"
     },
     {
       "id": "craft_training_integration",

@@ -19,33 +19,25 @@
 ================================
 
 【模块功能】
-管理锚点/保留数据集的加载和采样，用于 CRaFT 训练中的保留损失计算。
+管理离线生成的 AnchorCache 的加载和采样，用于 CRaFT 训练中的保留损失计算。
 
-【核心概念】
-锚点数据 (Anchor Data):
-- 旧任务的代表性样本，用于防止灾难性遗忘
-- 通常是从之前训练过的任务中采样的子集
-- 数量通常是新任务数据的 10%-50%
-
-【数据来源】
-1. 历史训练数据: 从之前的训练集中随机采样
-2. 验证集: 使用验证集作为锚点数据
-3. 合成数据: 通过数据增强生成的样本
-4. 核心集 (Coreset): 使用聚类等方法选择的代表性样本
+【AnchorCache 格式】
+由 build_anchor_cache.py 生成的 .pt shard 文件，每个包含：
+{
+    "pixel_values": Tensor[B, C, H, W],  # 图像，float32，已归一化到 [-1, 1]
+    "input_ids": Tensor[B, seq_len],     # 完整输入序列（prompt + teacher suffix）
+    "attention_mask": Tensor[B, seq_len], # 注意力掩码
+    "labels": Tensor[B, seq_len],        # 标签（prompt 部分为 -100，suffix 为 token ids）
+    "prompts": List[str],                # Prompt 字符串（用于调试）
+}
 
 【使用示例】
 ```python
-from lerobot.craft.anchor_cache import AnchorCacheDataset, create_anchor_dataloader
+from lerobot.craft.anchor_cache import AnchorCacheDataset, build_anchor_dataloader
 
-# 方法 1: 创建数据集
-anchor_dataset = AnchorCacheDataset(
-    dataset_path="lerobot/aloha_sim_insertion_human",
-    transform=preprocessor
-)
-
-# 方法 2: 直接创建 DataLoader（推荐）
-anchor_dataloader = create_anchor_dataloader(
-    dataset_path="lerobot/aloha_sim_insertion_human",
+# 创建 DataLoader
+anchor_dataloader = build_anchor_dataloader(
+    cache_dir="data/anchor_cache",
     batch_size=16,
     num_workers=4,
     shuffle=True
@@ -57,15 +49,20 @@ anchor_dl_iter = cycle(anchor_dataloader)
 
 for step in range(total_steps):
     anchor_batch = next(anchor_dl_iter)
+    # anchor_batch 包含: pixel_values, input_ids, attention_mask, labels
     retention_loss = compute_retention_loss(policy, anchor_batch)
 ```
 
 【设计考虑】
-1. 内存效率: 支持流式加载，不需要全部加载到内存
-2. 采样策略: 支持随机采样和重要性采样
-3. 数据格式: 与训练数据格式完全一致
-4. 预处理: 复用训练数据的预处理流程
+1. 离线生成: Teacher 生成在训练前完成，避免在线调用开销
+2. 确定性: Teacher 使用 temperature=0 生成，保证可复现
+3. Token-level CE: labels 正确标记了 prompt 和 suffix 部分
+4. 内存效率: 支持分 shard 加载，不需要全部加载到内存
 """
+
+import json
+import logging
+from pathlib import Path
 
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -73,89 +70,76 @@ from torch.utils.data import Dataset, DataLoader
 
 class AnchorCacheDataset(Dataset):
     """
-    锚点数据集包装器
+    AnchorCache 数据集加载器
     
     【功能说明】
-    封装锚点/保留数据的加载和访问逻辑，提供与 PyTorch Dataset 一致的接口。
+    从离线生成的 AnchorCache shards 中加载数据，用于 CRaFT 训练的保留损失计算。
     
     【数据格式】
-    锚点数据应与训练数据格式完全一致，包含相同的键：
-    - observation.images: 图像观测
-    - observation.state: 状态向量
-    - action: 动作标签
-    - episode_index: 轨迹索引（可选）
-    - frame_index: 帧索引（可选）
-    
-    【实现策略】
-    1. 简单封装: 直接使用 LeRobot 的 make_dataset() 加载
-    2. 子集采样: 从完整数据集中采样固定比例
-    3. 缓存优化: 预加载常用样本到内存
+    每个样本包含：
+    - pixel_values: Tensor[C, H, W], 图像，float32，[-1, 1]
+    - input_ids: Tensor[seq_len], 完整输入序列
+    - attention_mask: Tensor[seq_len], 注意力掩码
+    - labels: Tensor[seq_len], 标签（prompt=-100, suffix=token_ids）
     
     【参数】
-    dataset_path: str
-        锚点数据集路径
-        - HuggingFace dataset: "lerobot/aloha_sim_insertion_human"
-        - 本地路径: "/path/to/anchor/dataset"
-        
-    transform: callable, optional
-        数据预处理函数（通常是 preprocessor）
-        - 应与训练数据使用相同的预处理
-        - 包括归一化、图像变换等
+    cache_dir: str | Path
+        AnchorCache 目录路径，包含 shard_*.pt 文件和 metadata.json
     
     【使用示例】
     >>> from lerobot.craft.anchor_cache import AnchorCacheDataset
     >>> 
     >>> # 创建数据集
-    >>> anchor_dataset = AnchorCacheDataset(
-    ...     dataset_path="lerobot/aloha_sim_insertion_human",
-    ...     transform=None  # 预处理在 DataLoader 外部进行
-    ... )
+    >>> anchor_dataset = AnchorCacheDataset(cache_dir="data/anchor_cache")
     >>> 
     >>> # 访问样本
     >>> sample = anchor_dataset[0]
-    >>> print(sample.keys())  # dict_keys(['observation.images', 'observation.state', 'action'])
+    >>> print(sample.keys())  # dict_keys(['pixel_values', 'input_ids', 'attention_mask', 'labels'])
     >>> 
     >>> # 数据集大小
     >>> print(len(anchor_dataset))  # 1000
-    
-    【实现提示】
-    ```python
-    def __init__(self, dataset_path: str, transform=None):
-        from lerobot.datasets.factory import make_dataset
-        from lerobot.configs.train import DatasetConfig
-        
-        # 创建数据集配置
-        dataset_cfg = DatasetConfig(repo_id=dataset_path)
-        
-        # 加载数据集
-        self.dataset = make_dataset(dataset_cfg)
-        self.transform = transform
-    
-    def __len__(self):
-        return len(self.dataset)
-    
-    def __getitem__(self, idx):
-        sample = self.dataset[idx]
-        if self.transform:
-            sample = self.transform(sample)
-        return sample
-    ```
-    
-    TODO: 在下一阶段实现此类
     """
     
-    def __init__(self, dataset_path: str, transform=None):
+    def __init__(self, cache_dir: str | Path):
         """
-        初始化锚点数据集
+        初始化 AnchorCache 数据集
         
         【参数】
-        dataset_path: 数据集路径（HuggingFace repo_id 或本地路径）
-        transform: 可选的数据预处理函数
+        cache_dir: AnchorCache 目录路径
         """
-        self.dataset_path = dataset_path
-        self.transform = transform
-        # TODO: 在下一阶段加载数据集
-        raise NotImplementedError("AnchorCacheDataset.__init__: 待在下一阶段实现")
+        self.cache_dir = Path(cache_dir)
+        
+        if not self.cache_dir.exists():
+            raise FileNotFoundError(f"AnchorCache 目录不存在: {self.cache_dir}")
+        
+        # 加载元数据
+        metadata_path = self.cache_dir / "metadata.json"
+        if not metadata_path.exists():
+            raise FileNotFoundError(f"元数据文件不存在: {metadata_path}")
+        
+        with open(metadata_path) as f:
+            self.metadata = json.load(f)
+        
+        self.num_anchors = self.metadata["num_anchors"]
+        self.num_shards = self.metadata["num_shards"]
+        self.shard_size = self.metadata["shard_size"]
+        
+        # 构建 shard 文件列表
+        self.shard_files = []
+        for shard_idx in range(self.num_shards):
+            shard_path = self.cache_dir / f"shard_{shard_idx:04d}.pt"
+            if not shard_path.exists():
+                raise FileNotFoundError(f"Shard 文件不存在: {shard_path}")
+            self.shard_files.append(shard_path)
+        
+        # 缓存当前加载的 shard（避免重复加载）
+        self._current_shard_idx = None
+        self._current_shard_data = None
+        
+        logging.info(f"加载 AnchorCache: {self.cache_dir}")
+        logging.info(f"  - 总样本数: {self.num_anchors}")
+        logging.info(f"  - Shard 数量: {self.num_shards}")
+        logging.info(f"  - Shard 大小: {self.shard_size}")
     
     def __len__(self):
         """
@@ -164,9 +148,30 @@ class AnchorCacheDataset(Dataset):
         【返回值】
         int: 锚点数据集中的样本总数
         """
-        raise NotImplementedError("AnchorCacheDataset.__len__: 待在下一阶段实现")
+        return self.num_anchors
     
-    def __getitem__(self, idx):
+    def _load_shard(self, shard_idx: int) -> dict:
+        """
+        加载指定的 shard
+        
+        【参数】
+        shard_idx: Shard 索引
+        
+        【返回值】
+        dict: Shard 数据
+        """
+        if self._current_shard_idx == shard_idx:
+            return self._current_shard_data
+        
+        shard_path = self.shard_files[shard_idx]
+        shard_data = torch.load(shard_path, map_location="cpu")
+        
+        self._current_shard_idx = shard_idx
+        self._current_shard_data = shard_data
+        
+        return shard_data
+    
+    def __getitem__(self, idx: int) -> dict:
         """
         获取指定索引的样本
         
@@ -174,29 +179,45 @@ class AnchorCacheDataset(Dataset):
         idx: int, 样本索引
         
         【返回值】
-        dict: 包含观测、动作等的样本字典
+        dict: 包含 pixel_values, input_ids, attention_mask, labels 的样本字典
         """
-        raise NotImplementedError("AnchorCacheDataset.__getitem__: 待在下一阶段实现")
+        if idx < 0 or idx >= self.num_anchors:
+            raise IndexError(f"索引 {idx} 超出范围 [0, {self.num_anchors})")
+        
+        # 确定样本所在的 shard
+        shard_idx = idx // self.shard_size
+        local_idx = idx % self.shard_size
+        
+        # 加载 shard
+        shard_data = self._load_shard(shard_idx)
+        
+        # 提取样本
+        sample = {
+            "pixel_values": shard_data["pixel_values"][local_idx],
+            "input_ids": shard_data["input_ids"][local_idx],
+            "attention_mask": shard_data["attention_mask"][local_idx],
+            "labels": shard_data["labels"][local_idx],
+        }
+        
+        return sample
 
 
-def create_anchor_dataloader(
-    dataset_path: str,
+def build_anchor_dataloader(
+    cache_dir: str | Path,
     batch_size: int,
     num_workers: int = 4,
     shuffle: bool = True,
     pin_memory: bool = True,
 ) -> DataLoader:
     """
-    创建锚点数据的 DataLoader（推荐使用此函数）
+    创建 AnchorCache 的 DataLoader（推荐使用此函数）
     
     【功能说明】
     封装 AnchorCacheDataset 和 DataLoader 的创建逻辑，提供一站式接口。
     
     【参数】
-    dataset_path: str
-        锚点数据集路径
-        - HuggingFace dataset: "lerobot/aloha_sim_insertion_human"
-        - 本地路径: "/path/to/anchor/dataset"
+    cache_dir: str | Path
+        AnchorCache 目录路径，包含 shard_*.pt 文件和 metadata.json
         
     batch_size: int
         批次大小
@@ -225,12 +246,12 @@ def create_anchor_dataloader(
         - 支持多进程加载和预取
     
     【使用示例】
-    >>> from lerobot.craft.anchor_cache import create_anchor_dataloader
+    >>> from lerobot.craft.anchor_cache import build_anchor_dataloader
     >>> from lerobot.datasets.utils import cycle
     >>> 
     >>> # 创建 DataLoader
-    >>> anchor_dataloader = create_anchor_dataloader(
-    ...     dataset_path="lerobot/aloha_sim_insertion_human",
+    >>> anchor_dataloader = build_anchor_dataloader(
+    ...     cache_dir="data/anchor_cache",
     ...     batch_size=16,
     ...     num_workers=4,
     ...     shuffle=True
@@ -242,27 +263,8 @@ def create_anchor_dataloader(
     >>> # 在训练循环中使用
     >>> for step in range(10000):
     ...     anchor_batch = next(anchor_dl_iter)
-    ...     # anchor_batch 是一个字典，包含批次数据
-    ...     print(anchor_batch["action"].shape)  # torch.Size([16, 50, 7])
-    
-    【实现提示】
-    ```python
-    # 1. 创建数据集
-    anchor_dataset = AnchorCacheDataset(dataset_path, transform=None)
-    
-    # 2. 创建 DataLoader
-    dataloader = DataLoader(
-        anchor_dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        drop_last=False,  # 保留最后不完整的批次
-        prefetch_factor=2 if num_workers > 0 else None,  # 预取 2 个批次
-    )
-    
-    return dataloader
-    ```
+    ...     # anchor_batch 包含: pixel_values, input_ids, attention_mask, labels
+    ...     print(anchor_batch["pixel_values"].shape)  # torch.Size([16, 3, 224, 224])
     
     【性能优化】
     1. 批次大小: 根据 GPU 内存调整，通常为任务批次的 50%-100%
@@ -281,20 +283,38 @@ def create_anchor_dataloader(
     )
     
     # 锚点数据 DataLoader（旧任务）
-    anchor_dataloader = create_anchor_dataloader(
-        dataset_path="path/to/anchor",
+    anchor_dataloader = build_anchor_dataloader(
+        cache_dir="data/anchor_cache",
         batch_size=16,  # 通常较小
         num_workers=4,
         shuffle=True
     )
     
-    # 两者格式完全一致，可以用相同的方式处理
+    # 两者格式不同：anchor 包含预生成的 teacher outputs
     task_batch = next(iter(task_dataloader))
     anchor_batch = next(iter(anchor_dataloader))
-    assert task_batch.keys() == anchor_batch.keys()
+    # anchor_batch: {"pixel_values", "input_ids", "attention_mask", "labels"}
     ```
-    
-    TODO: 在下一阶段实现此函数
     """
-    raise NotImplementedError("create_anchor_dataloader: 待在下一阶段实现")
+    # 创建数据集
+    anchor_dataset = AnchorCacheDataset(cache_dir)
+    
+    # 创建 DataLoader
+    dataloader = DataLoader(
+        anchor_dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        drop_last=False,  # 保留最后不完整的批次
+        prefetch_factor=2 if num_workers > 0 else None,  # 预取 2 个批次
+    )
+    
+    logging.info(f"创建 AnchorCache DataLoader:")
+    logging.info(f"  - Batch size: {batch_size}")
+    logging.info(f"  - Num workers: {num_workers}")
+    logging.info(f"  - Shuffle: {shuffle}")
+    logging.info(f"  - Pin memory: {pin_memory}")
+    
+    return dataloader
 
