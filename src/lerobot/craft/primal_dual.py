@@ -162,10 +162,29 @@ def epsilon_schedule(
     >>> 
     >>> eps_1000 = epsilon_schedule(1000, 1.0, 0.1, 1000, "linear")
     >>> print(eps_1000)  # 0.1 (最终值)
-    
-    TODO: 在下一阶段实现此函数
     """
-    raise NotImplementedError("epsilon_schedule: 待在下一阶段实现")
+    import math
+    
+    # 避免除零
+    if decay_steps <= 0:
+        return epsilon_end
+    
+    # 计算进度比例 [0, 1]
+    progress = min(step / decay_steps, 1.0)
+    
+    if schedule_type == "linear":
+        # 线性退火
+        epsilon = epsilon_start - (epsilon_start - epsilon_end) * progress
+    elif schedule_type == "cosine":
+        # 余弦退火
+        epsilon = epsilon_end + 0.5 * (epsilon_start - epsilon_end) * (1 + math.cos(math.pi * progress))
+    elif schedule_type == "exponential":
+        # 指数退火
+        epsilon = epsilon_end + (epsilon_start - epsilon_end) * math.exp(-5 * progress)
+    else:
+        raise ValueError(f"Unknown schedule type: {schedule_type}. Must be one of ['linear', 'cosine', 'exponential']")
+    
+    return epsilon
 
 
 def update_lambda(
@@ -277,8 +296,15 @@ def update_lambda(
     ...     lambda_max=10.0
     ... )
     >>> print(lambda_new)  # 10.0 (裁剪到上界)
-    
-    TODO: 在下一阶段实现此函数
     """
-    raise NotImplementedError("update_lambda: 待在下一阶段实现")
+    # 计算约束违反程度
+    constraint_violation = retention_loss - epsilon
+    
+    # 梯度上升更新
+    new_lambda = current_lambda + lambda_lr * constraint_violation
+    
+    # 裁剪到合法范围 [0, lambda_max]
+    new_lambda = max(0.0, min(new_lambda, lambda_max))
+    
+    return new_lambda
 

@@ -91,100 +91,157 @@ def update_policy_craft(
     lock=None,
 ) -> tuple[MetricsTracker, dict, float]:
     """
-    Performs a single CRaFT training step with dual-objective optimization.
+    执行单步 CRaFT 训练（双目标优化）
     
-    CRaFT training loop (per step):
-    1. Forward pass on task batch → L_task
-    2. Backward pass on L_task → ∇L_task
-    3. Forward pass on anchor batch → L_retain
-    4. Backward pass on L_retain → ∇L_retain
-    5. Gradient surgery: project if conflict detected
-    6. Merge gradients: g_final = ∇L_task + λ * ∇L_retain
-    7. Optimizer step with g_final
-    8. Update λ based on constraint violation: λ ← λ + λ_lr * (L_retain - ε)
+    【CRaFT 训练流程】
+    1. 前向传播（任务数据）→ L_task
+    2. 反向传播 L_task → ∇L_task（保存梯度）
+    3. 前向传播（锚点数据）→ L_retain
+    4. 反向传播 L_retain → ∇L_retain（保存梯度）
+    5. 梯度手术：检测冲突并投影
+    6. 合并梯度：g_final = ∇L_task + λ * ∇L_retain
+    7. 优化器更新（使用 g_final）
+    8. 更新 λ：λ ← λ + λ_lr * (L_retain - ε)
     
-    Args:
-        train_metrics: MetricsTracker for logging
-        policy: Policy model to train
-        task_batch: Batch from new task dataset
-        anchor_batch: Batch from anchor/retention dataset (can be None for dry-run)
-        optimizer: Optimizer instance
-        grad_clip_norm: Gradient clipping norm
-        accelerator: Accelerator for distributed training
-        craft_config: CRaFT configuration
-        current_lambda: Current Lagrangian multiplier value
-        current_epsilon: Current retention loss threshold
-        lr_scheduler: Optional learning rate scheduler
-        lock: Optional lock for thread-safe updates
+    【参数】
+    train_metrics: 训练指标跟踪器
+    policy: 策略模型
+    task_batch: 任务数据批次
+    anchor_batch: 锚点数据批次（可为 None，表示不计算保留损失）
+    optimizer: 优化器
+    grad_clip_norm: 梯度裁剪范数
+    accelerator: 分布式训练加速器
+    craft_config: CRaFT 配置
+    current_lambda: 当前 λ 值
+    current_epsilon: 当前 ε 阈值
+    lr_scheduler: 学习率调度器（可选）
+    lock: 线程锁（可选）
     
-    Returns:
-        Tuple of (updated_metrics, output_dict, updated_lambda)
-    
-    TODO: Implement full CRaFT training logic in next phase.
-    Current implementation: baseline single-objective training (task loss only).
+    【返回值】
+    (更新后的指标, 输出字典, 更新后的 λ)
     """
+    from lerobot.craft.grad_surgery import compute_dot, project_if_conflict, merge_grads
+    from lerobot.craft.primal_dual import update_lambda
+    
     start_time = time.perf_counter()
     policy.train()
     
     # ============================================================================
-    # PHASE 1: Task Loss (Standard Training)
+    # PHASE 1: 任务损失（标准训练）
     # ============================================================================
     with accelerator.autocast():
         task_loss, output_dict = policy.forward(task_batch)
     
-    # Backward pass for task loss
+    # 第一次反向传播：计算任务梯度
     accelerator.backward(task_loss)
     
-    # ============================================================================
-    # TODO: PHASE 2: Retention Loss (CRaFT-specific)
-    # ============================================================================
-    # if anchor_batch is not None:
-    #     # 1. Compute retention loss
-    #     from lerobot.craft.retention_loss import compute_retention_loss
-    #     with accelerator.autocast():
-    #         retention_loss = compute_retention_loss(policy, anchor_batch)
-    #     
-    #     # 2. Backward pass for retention loss (accumulate gradients)
-    #     accelerator.backward(retention_loss)
-    #     
-    #     # 3. Extract gradients for both objectives
-    #     task_grads = [p.grad.clone() for p in policy.parameters() if p.grad is not None]
-    #     # Note: Need to separate task and retention gradients properly
-    #     
-    #     # 4. Gradient surgery (projection if conflict)
-    #     if craft_config.use_grad_projection:
-    #         from lerobot.craft.grad_surgery import project_if_conflict, merge_grads
-    #         task_grads_proj, retain_grads_proj, conflict = project_if_conflict(
-    #             task_grads, retention_grads, craft_config.conflict_threshold
-    #         )
-    #         final_grads = merge_grads(
-    #             task_grads_proj, retain_grads_proj, current_lambda, craft_config.projection_mode
-    #         )
-    #     else:
-    #         # Simple weighted combination
-    #         final_grads = [g_t + current_lambda * g_r for g_t, g_r in zip(task_grads, retention_grads)]
-    #     
-    #     # 5. Replace gradients with merged gradients
-    #     for param, grad in zip(policy.parameters(), final_grads):
-    #         param.grad = grad
-    #     
-    #     # 6. Update lambda (primal-dual)
-    #     from lerobot.craft.primal_dual import update_lambda
-    #     current_lambda = update_lambda(
-    #         current_lambda,
-    #         retention_loss.item(),
-    #         current_epsilon,
-    #         craft_config.lambda_lr,
-    #         craft_config.lambda_max,
-    #     )
-    #     
-    #     # Log retention metrics
-    #     output_dict["retention_loss"] = retention_loss.item()
-    #     output_dict["lambda"] = current_lambda
-    #     output_dict["epsilon"] = current_epsilon
+    # 保存任务梯度（需要 clone，因为后续会清零）
+    task_grads = [
+        p.grad.clone() if p.grad is not None else None
+        for p in policy.parameters()
+    ]
     
     # ============================================================================
-    # Gradient Clipping and Optimizer Step (Standard)
+    # PHASE 2: 保留损失（CRaFT 特有）
+    # ============================================================================
+    retention_loss_value = None
+    grad_conflict_detected = False
+    grad_dot_product = None
+    
+    if anchor_batch is not None and craft_config.enabled:
+        # 清零梯度，准备第二次反向传播
+        optimizer.zero_grad()
+        
+        # 前向传播：计算保留损失
+        with accelerator.autocast():
+            retention_loss, _ = policy.forward(anchor_batch)
+        
+        # 第二次反向传播：计算保留梯度
+        accelerator.backward(retention_loss)
+        
+        # 保存保留梯度
+        retention_grads = [
+            p.grad.clone() if p.grad is not None else None
+            for p in policy.parameters()
+        ]
+        
+        # 清零梯度，准备设置合并后的梯度
+        optimizer.zero_grad()
+        
+        # ========================================================================
+        # 梯度手术：冲突检测与投影
+        # ========================================================================
+        # 过滤掉 None 梯度（某些参数可能不参与计算）
+        task_grads_filtered = [g for g in task_grads if g is not None]
+        retention_grads_filtered = [g for g in retention_grads if g is not None]
+        
+        if len(task_grads_filtered) > 0 and len(retention_grads_filtered) > 0:
+            # 计算梯度点积（用于冲突检测和日志）
+            grad_dot_product = compute_dot(task_grads_filtered, retention_grads_filtered).item()
+            
+            # 如果启用梯度投影且检测到冲突
+            if craft_config.use_grad_projection:
+                task_grads_proj, retention_grads_proj, grad_conflict_detected = project_if_conflict(
+                    task_grads,
+                    retention_grads,
+                    craft_config.conflict_threshold,
+                )
+            else:
+                # 不使用投影，直接使用原梯度
+                task_grads_proj = task_grads
+                retention_grads_proj = retention_grads
+            
+            # 合并梯度：g_final = g_task + λ * g_retain
+            final_grads = merge_grads(
+                task_grads_proj,
+                retention_grads_proj,
+                current_lambda,
+                craft_config.projection_mode,
+            )
+        else:
+            # 如果没有有效梯度，使用任务梯度
+            final_grads = task_grads
+        
+        # 设置合并后的梯度到模型参数
+        for param, grad in zip(policy.parameters(), final_grads):
+            if grad is not None:
+                param.grad = grad
+        
+        # ========================================================================
+        # 原对偶优化：更新 λ
+        # ========================================================================
+        retention_loss_value = retention_loss.item()
+        
+        # 在分布式训练中，需要对 retention_loss 求平均
+        if accelerator.num_processes > 1:
+            retention_loss_tensor = torch.tensor(retention_loss_value, device=accelerator.device)
+            retention_loss_tensor = accelerator.gather(retention_loss_tensor).mean()
+            retention_loss_value = retention_loss_tensor.item()
+        
+        # 更新 λ
+        current_lambda = update_lambda(
+            current_lambda,
+            retention_loss_value,
+            current_epsilon,
+            craft_config.lambda_lr,
+            craft_config.lambda_max,
+        )
+        
+        # 记录 CRaFT 特定指标
+        output_dict["retention_loss"] = retention_loss_value
+        output_dict["lambda"] = current_lambda
+        output_dict["epsilon"] = current_epsilon
+        output_dict["grad_conflict"] = 1.0 if grad_conflict_detected else 0.0
+        if grad_dot_product is not None:
+            output_dict["grad_dot"] = grad_dot_product
+    else:
+        # 没有锚点数据或未启用 CRaFT：使用任务梯度
+        for param, grad in zip(policy.parameters(), task_grads):
+            if grad is not None:
+                param.grad = grad
+    
+    # ============================================================================
+    # 梯度裁剪和优化器更新（标准流程）
     # ============================================================================
     if grad_clip_norm > 0:
         grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
@@ -204,7 +261,9 @@ def update_policy_craft(
     if has_method(accelerator.unwrap_model(policy, keep_fp32_wrapper=True), "update"):
         accelerator.unwrap_model(policy, keep_fp32_wrapper=True).update()
     
-    # Update metrics
+    # ============================================================================
+    # 更新指标
+    # ============================================================================
     train_metrics.loss = task_loss.item()
     train_metrics.grad_norm = grad_norm.item()
     train_metrics.lr = optimizer.param_groups[0]["lr"]
@@ -214,18 +273,25 @@ def update_policy_craft(
 
 
 @parser.wrap()
-def train_craft(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+def train_craft(
+    cfg: TrainPipelineConfig,
+    craft_config: CraftConfig | None = None,
+    accelerator: Accelerator | None = None,
+):
     """
-    Main function for CRaFT training.
+    CRaFT 训练主函数
     
-    This function extends the baseline train() with CRaFT-specific components:
-    - Loads anchor dataset for retention loss
-    - Initializes CRaFT config (λ, ε schedule, etc.)
-    - Calls update_policy_craft() instead of update_policy()
+    【功能说明】
+    扩展 baseline 训练，增加 CRaFT 特有组件：
+    - 加载锚点数据集用于保留损失计算
+    - 初始化 CRaFT 配置（λ、ε 调度等）
+    - 使用 update_policy_craft() 替代标准 update_policy()
+    - 实现 K-step 策略（每 K 步计算一次保留损失）
     
-    Current status: DRY-RUN mode
-    - Runs 1 batch forward pass and exits
-    - Validates that policy loading and data pipeline work correctly
+    【参数】
+    cfg: 训练配置
+    craft_config: CRaFT 配置（如果为 None，使用默认配置）
+    accelerator: 分布式训练加速器（可选）
     """
     cfg.validate()
     
@@ -277,23 +343,55 @@ def train_craft(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None
         dataset = make_dataset(cfg)
     
     # ============================================================================
-    # TODO: Load Anchor Dataset (CRaFT-specific)
+    # 加载锚点数据集（CRaFT 特有）
     # ============================================================================
-    # Initialize CRaFT config (placeholder for now)
-    craft_config = CraftConfig()
+    # 初始化 CRaFT 配置
+    if craft_config is None:
+        craft_config = CraftConfig()
     
-    # TODO: Load anchor dataset in next phase
-    # if craft_config.anchor_dataset_path:
-    #     from lerobot.craft.anchor_cache import create_anchor_dataloader
-    #     anchor_dataloader = create_anchor_dataloader(
-    #         craft_config.anchor_dataset_path,
-    #         craft_config.anchor_batch_size,
-    #         num_workers=cfg.num_workers,
-    #     )
-    #     anchor_dl_iter = cycle(anchor_dataloader)
-    # else:
-    #     anchor_dl_iter = None
-    anchor_dl_iter = None  # Placeholder for dry-run
+    # 加载 AnchorCache
+    anchor_dl_iter = None
+    if craft_config.enabled and craft_config.anchor_cache_dir:
+        if is_main_process:
+            logging.info(colored("=" * 80, "cyan"))
+            logging.info(colored("加载 AnchorCache", "cyan", attrs=["bold"]))
+            logging.info(colored("=" * 80, "cyan"))
+            logging.info(f"AnchorCache 目录: {craft_config.anchor_cache_dir}")
+            logging.info(f"锚点批次大小: {craft_config.anchor_batch_size}")
+            logging.info(f"保留频率 (K-step): 每 {craft_config.retention_freq} 步")
+        
+        try:
+            from lerobot.craft.anchor_cache import AnchorCacheDataset
+            
+            anchor_dataset = AnchorCacheDataset(
+                cache_dir=craft_config.anchor_cache_dir,
+                transform=preprocessor,  # 使用与任务数据相同的预处理
+            )
+            
+            anchor_dataloader = torch.utils.data.DataLoader(
+                anchor_dataset,
+                batch_size=craft_config.anchor_batch_size,
+                shuffle=True,
+                num_workers=cfg.num_workers,
+                pin_memory=device.type == "cuda",
+                drop_last=True,
+            )
+            
+            # 使用 cycle 使其无限循环
+            anchor_dl_iter = cycle(anchor_dataloader)
+            
+            if is_main_process:
+                logging.info(colored(f"✓ AnchorCache 加载成功: {len(anchor_dataset)} 样本", "green"))
+        except Exception as e:
+            if is_main_process:
+                logging.warning(colored(f"⚠ AnchorCache 加载失败: {e}", "yellow"))
+                logging.warning(colored("将以 baseline 模式运行（无保留损失）", "yellow"))
+            craft_config.enabled = False
+    elif craft_config.enabled:
+        if is_main_process:
+            logging.warning(colored("⚠ CRaFT 已启用但未提供 anchor_cache_dir", "yellow"))
+            logging.warning(colored("将以 baseline 模式运行", "yellow"))
+        craft_config.enabled = False
     
     # ============================================================================
     # Environment (for evaluation)
@@ -448,62 +546,253 @@ def train_craft(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None
     )
     
     # ============================================================================
-    # CRaFT State Initialization
+    # CRaFT 状态初始化
     # ============================================================================
     current_lambda = craft_config.initial_lambda
-    current_epsilon = craft_config.epsilon_start
+    
+    # 计算 epsilon 衰减步数
+    epsilon_decay_steps = craft_config.epsilon_decay_steps
+    if epsilon_decay_steps == 0:
+        epsilon_decay_steps = cfg.steps
     
     if is_main_process:
-        logging.info(colored("=" * 80, "green"))
-        logging.info(colored("DRY-RUN: Running 1 batch forward pass", "green", attrs=["bold"]))
-        logging.info(colored("=" * 80, "green"))
-        logging.info(f"Initial λ: {current_lambda}")
-        logging.info(f"Initial ε: {current_epsilon}")
+        logging.info(colored("=" * 80, "cyan"))
+        logging.info(colored("CRaFT 训练配置", "cyan", attrs=["bold"]))
+        logging.info(colored("=" * 80, "cyan"))
+        logging.info(f"CRaFT 启用: {craft_config.enabled}")
+        if craft_config.enabled:
+            logging.info(f"初始 λ: {current_lambda}")
+            logging.info(f"λ 学习率: {craft_config.lambda_lr}")
+            logging.info(f"λ 最大值: {craft_config.lambda_max}")
+            logging.info(f"ε 起始值: {craft_config.epsilon_start}")
+            logging.info(f"ε 最终值: {craft_config.epsilon_end}")
+            logging.info(f"ε 衰减步数: {epsilon_decay_steps}")
+            logging.info(f"梯度投影: {craft_config.use_grad_projection}")
+            logging.info(f"冲突阈值: {craft_config.conflict_threshold}")
+            logging.info(f"合并模式: {craft_config.projection_mode}")
+        logging.info(colored("=" * 80, "cyan"))
+    
+    # Lambda 历史记录（用于分析）
+    lambda_history = [] if craft_config.save_lambda_history else None
     
     # ============================================================================
-    # DRY-RUN: Single Batch Forward Pass
+    # 训练循环
     # ============================================================================
-    start_time = time.perf_counter()
-    batch = next(dl_iter)
-    batch = preprocessor(batch)
-    train_tracker.dataloading_s = time.perf_counter() - start_time
-    
-    if is_main_process:
-        logging.info(f"Batch loaded in {train_tracker.dataloading_s:.3f}s")
-        logging.info(f"Batch keys: {list(batch.keys())}")
-    
-    # Run one training step (dry-run mode: no anchor batch)
-    train_tracker, output_dict, current_lambda = update_policy_craft(
-        train_tracker,
-        policy,
-        batch,
-        anchor_batch=None,  # No anchor data in dry-run
-        optimizer=optimizer,
-        grad_clip_norm=cfg.optimizer.grad_clip_norm,
-        accelerator=accelerator,
-        craft_config=craft_config,
-        current_lambda=current_lambda,
-        current_epsilon=current_epsilon,
-        lr_scheduler=lr_scheduler,
-    )
-    
-    step += 1
-    train_tracker.step()
-    
     if is_main_process:
         logging.info(colored("=" * 80, "green"))
-        logging.info(colored("DRY-RUN SUCCESSFUL!", "green", attrs=["bold"]))
+        logging.info(colored("开始训练", "green", attrs=["bold"]))
         logging.info(colored("=" * 80, "green"))
-        logging.info(train_tracker)
-        logging.info(f"Task loss: {output_dict.get('loss', 'N/A')}")
-        logging.info(f"Updated λ: {current_lambda}")
-        logging.info("")
-        logging.info(colored("Next steps:", "yellow", attrs=["bold"]))
-        logging.info("  1. Implement anchor dataset loading (anchor_cache.py)")
-        logging.info("  2. Implement retention loss computation (retention_loss.py)")
-        logging.info("  3. Implement gradient surgery (grad_surgery.py)")
-        logging.info("  4. Implement primal-dual updates (primal_dual.py)")
-        logging.info("  5. Uncomment TODO sections in update_policy_craft()")
+    
+    while step < cfg.steps:
+        # ========================================================================
+        # 数据加载
+        # ========================================================================
+        start_time = time.perf_counter()
+        batch = next(dl_iter)
+        batch = preprocessor(batch)
+        train_tracker.dataloading_s = time.perf_counter() - start_time
+        
+        # ========================================================================
+        # 计算当前 epsilon（退火调度）
+        # ========================================================================
+        from lerobot.craft.primal_dual import epsilon_schedule
+        
+        current_epsilon = epsilon_schedule(
+            step,
+            craft_config.epsilon_start,
+            craft_config.epsilon_end,
+            epsilon_decay_steps,
+            schedule_type="linear",
+        )
+        
+        # ========================================================================
+        # K-step 策略：每 K 步计算一次保留损失
+        # ========================================================================
+        anchor_batch = None
+        if craft_config.enabled and anchor_dl_iter is not None:
+            if step % craft_config.retention_freq == 0:
+                # 加载锚点批次
+                anchor_batch = next(anchor_dl_iter)
+                # 注意：anchor_batch 已经在 AnchorCacheDataset 中预处理过
+        
+        # ========================================================================
+        # 训练步骤（CRaFT 或 baseline）
+        # ========================================================================
+        train_tracker, output_dict, current_lambda = update_policy_craft(
+            train_tracker,
+            policy,
+            batch,
+            anchor_batch=anchor_batch,
+            optimizer=optimizer,
+            grad_clip_norm=cfg.optimizer.grad_clip_norm,
+            accelerator=accelerator,
+            craft_config=craft_config,
+            current_lambda=current_lambda,
+            current_epsilon=current_epsilon,
+            lr_scheduler=lr_scheduler,
+        )
+        
+        step += 1
+        train_tracker.step()
+        
+        # 保存 lambda 历史
+        if lambda_history is not None and craft_config.enabled:
+            lambda_history.append({
+                "step": step,
+                "lambda": current_lambda,
+                "epsilon": current_epsilon,
+                "retention_loss": output_dict.get("retention_loss"),
+            })
+        
+        # ========================================================================
+        # 日志记录
+        # ========================================================================
+        if step % cfg.log_freq == 0 and is_main_process:
+            log_msg = f"Step {step}/{cfg.steps} | {train_tracker}"
+            
+            # CRaFT 特定指标
+            if craft_config.enabled and "retention_loss" in output_dict:
+                log_msg += f" | L_ret={output_dict['retention_loss']:.3f}"
+                log_msg += f" | λ={current_lambda:.3f}"
+                log_msg += f" | ε={current_epsilon:.3f}"
+                
+                if "grad_conflict" in output_dict and output_dict["grad_conflict"] > 0:
+                    log_msg += " | conflict=✓"
+                
+                if "grad_dot" in output_dict:
+                    log_msg += f" | cos={output_dict['grad_dot']:.3f}"
+            
+            logging.info(log_msg)
+            
+            # WandB 日志
+            if wandb_logger is not None:
+                wandb_log_dict = {
+                    "train/loss": train_tracker.loss.avg,
+                    "train/grad_norm": train_tracker.grad_norm.avg,
+                    "train/lr": train_tracker.lr.avg,
+                    "train/step": step,
+                }
+                
+                if craft_config.enabled and "retention_loss" in output_dict:
+                    wandb_log_dict.update({
+                        "craft/retention_loss": output_dict["retention_loss"],
+                        "craft/lambda": current_lambda,
+                        "craft/epsilon": current_epsilon,
+                        "craft/grad_conflict": output_dict.get("grad_conflict", 0),
+                    })
+                    if "grad_dot" in output_dict:
+                        wandb_log_dict["craft/grad_dot"] = output_dict["grad_dot"]
+                
+                wandb_logger.log(wandb_log_dict, step=step)
+        
+        # ========================================================================
+        # 评估
+        # ========================================================================
+        if cfg.eval_freq > 0 and step % cfg.eval_freq == 0 and eval_env is not None:
+            if is_main_process:
+                logging.info(colored(f"Evaluating at step {step}", "yellow", attrs=["bold"]))
+            
+            policy.eval()
+            
+            with torch.no_grad():
+                eval_info = eval_policy_all(
+                    eval_env,
+                    policy,
+                    cfg.eval.n_episodes,
+                    max_episodes_rendered=cfg.eval.n_episodes_rendered,
+                    videos_dir=cfg.output_dir / "eval" / f"videos_step_{step:06d}",
+                    start_seed=cfg.seed,
+                )
+            
+            if is_main_process:
+                logging.info(f"Eval success rate: {eval_info['aggregated']['pc_success']:.2%}")
+                
+                if wandb_logger is not None:
+                    wandb_logger.log(
+                        {
+                            "eval/success_rate": eval_info["aggregated"]["pc_success"],
+                            "eval/avg_reward": eval_info["aggregated"]["avg_sum_reward"],
+                        },
+                        step=step,
+                    )
+            
+            policy.train()
+        
+        # ========================================================================
+        # 保存检查点
+        # ========================================================================
+        if cfg.save_checkpoint and step % cfg.save_freq == 0:
+            if is_main_process:
+                logging.info(colored(f"Saving checkpoint at step {step}", "yellow"))
+            
+            checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, step)
+            save_checkpoint(
+                checkpoint_dir,
+                policy,
+                optimizer,
+                lr_scheduler,
+                step,
+                cfg,
+                accelerator=accelerator,
+            )
+            
+            # 保存 CRaFT 状态
+            if craft_config.enabled and is_main_process:
+                craft_state = {
+                    "lambda": current_lambda,
+                    "epsilon": current_epsilon,
+                    "step": step,
+                }
+                if lambda_history is not None:
+                    craft_state["lambda_history"] = lambda_history
+                
+                torch.save(craft_state, checkpoint_dir / "craft_state.pt")
+            
+            if is_main_process:
+                update_last_checkpoint(cfg.output_dir, checkpoint_dir)
+    
+    # ============================================================================
+    # 训练结束
+    # ============================================================================
+    if is_main_process:
+        logging.info(colored("=" * 80, "green"))
+        logging.info(colored("训练完成！", "green", attrs=["bold"]))
+        logging.info(colored("=" * 80, "green"))
+        
+        # 保存最终检查点
+        if cfg.save_checkpoint:
+            final_checkpoint_dir = cfg.output_dir / "final"
+            save_checkpoint(
+                final_checkpoint_dir,
+                policy,
+                optimizer,
+                lr_scheduler,
+                step,
+                cfg,
+                accelerator=accelerator,
+            )
+            
+            # 保存 CRaFT 最终状态
+            if craft_config.enabled:
+                craft_state = {
+                    "lambda": current_lambda,
+                    "epsilon": current_epsilon,
+                    "step": step,
+                }
+                if lambda_history is not None:
+                    craft_state["lambda_history"] = lambda_history
+                
+                torch.save(craft_state, final_checkpoint_dir / "craft_state.pt")
+                
+                # 保存 lambda 历史为 CSV（便于分析）
+                if lambda_history is not None:
+                    import csv
+                    with open(final_checkpoint_dir / "lambda_history.csv", "w", newline="") as f:
+                        writer = csv.DictWriter(f, fieldnames=["step", "lambda", "epsilon", "retention_loss"])
+                        writer.writeheader()
+                        writer.writerows(lambda_history)
+                    
+                    logging.info(f"Lambda 历史已保存到: {final_checkpoint_dir / 'lambda_history.csv'}")
     
     if eval_env:
         close_envs(eval_env)
@@ -512,7 +801,7 @@ def train_craft(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None
     accelerator.end_training()
     
     if is_main_process:
-        logging.info("End of CRaFT dry-run")
+        logging.info("CRaFT 训练结束")
 
 
 def main():

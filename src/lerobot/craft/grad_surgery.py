@@ -97,10 +97,13 @@ def compute_dot(grad1: list[Tensor], grad2: list[Tensor]) -> Tensor:
     >>> grad_retain = [torch.tensor([1.0, -1.0]), torch.tensor([0.5])]
     >>> dot = compute_dot(grad_task, grad_retain)
     >>> print(dot)  # 1*1 + 2*(-1) + 3*0.5 = 0.5
-    
-    TODO: 在下一阶段实现此函数
     """
-    raise NotImplementedError("compute_dot: 待在下一阶段实现")
+    # 展平并拼接所有梯度
+    flat_grad1 = torch.cat([g.flatten() for g in grad1 if g is not None])
+    flat_grad2 = torch.cat([g.flatten() for g in grad2 if g is not None])
+    
+    # 计算点积
+    return torch.dot(flat_grad1, flat_grad2)
 
 
 def project_if_conflict(
@@ -166,10 +169,32 @@ def project_if_conflict(
     ... )
     >>> print(conflict)  # True
     >>> print(proj_task)  # [tensor([0.0, 0.0])] - 完全投影掉
-    
-    TODO: 在下一阶段实现此函数
     """
-    raise NotImplementedError("project_if_conflict: 待在下一阶段实现")
+    # 计算点积
+    dot_product = compute_dot(grad_task, grad_retain)
+    
+    # 检测冲突（负点积表示方向相反）
+    if dot_product < conflict_threshold:
+        # 计算 ||g_retain||²
+        norm_squared = compute_dot(grad_retain, grad_retain)
+        
+        # 避免除零
+        if norm_squared < 1e-12:
+            return grad_task, grad_retain, False
+        
+        # 计算投影系数
+        projection_coef = dot_product / norm_squared
+        
+        # 投影：g_task_proj = g_task - (dot / ||g_retain||²) * g_retain
+        projected_grad_task = [
+            g_t - projection_coef * g_r if g_t is not None and g_r is not None else g_t
+            for g_t, g_r in zip(grad_task, grad_retain)
+        ]
+        
+        return projected_grad_task, grad_retain, True
+    else:
+        # 无冲突，保持原梯度
+        return grad_task, grad_retain, False
 
 
 def merge_grads(
@@ -247,8 +272,28 @@ def merge_grads(
     >>> # Equal 模式
     >>> merged = merge_grads(grad_task, grad_retain, lambda_weight=2.0, mode="equal")
     >>> print(merged)  # [tensor([0.75, 0.75])] = 0.5 * ([1.0, 2.0] + [0.5, -0.5])
-    
-    TODO: 在下一阶段实现此函数
     """
-    raise NotImplementedError("merge_grads: 待在下一阶段实现")
+    if mode == "weighted":
+        # g_final = g_task + λ * g_retain
+        merged = [
+            g_t + lambda_weight * g_r if g_t is not None and g_r is not None else g_t
+            for g_t, g_r in zip(grad_task, grad_retain)
+        ]
+    elif mode == "equal":
+        # g_final = 0.5 * (g_task + g_retain)
+        merged = [
+            0.5 * (g_t + g_r) if g_t is not None and g_r is not None else g_t
+            for g_t, g_r in zip(grad_task, grad_retain)
+        ]
+    elif mode == "task_priority":
+        # g_final = g_task + min(λ, 1.0) * g_retain
+        capped_lambda = min(lambda_weight, 1.0)
+        merged = [
+            g_t + capped_lambda * g_r if g_t is not None and g_r is not None else g_t
+            for g_t, g_r in zip(grad_task, grad_retain)
+        ]
+    else:
+        raise ValueError(f"Unknown merge mode: {mode}. Must be one of ['weighted', 'equal', 'task_priority']")
+    
+    return merged
 

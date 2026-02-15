@@ -5,7 +5,7 @@
     {
       "id": "grad_surgery_math",
       "name": "Gradient Surgery Math Operations",
-      "status": "not_started",
+      "status": "passing",
       "priority": "high",
       "description": "Unit tests for gradient dot product, projection, and merging operations",
       "file": "tests/test_grad_surgery_math.py",
@@ -20,27 +20,30 @@
       ],
       "dependencies": [
         "grad_surgery.py implementation"
-      ]
+      ],
+      "notes": "grad_surgery.py 已完整实现（compute_dot, project_if_conflict, merge_grads）"
     },
     {
       "id": "train_craft_dryrun",
       "name": "CRaFT Training Dry-Run",
-      "status": "not_started",
+      "status": "ready_for_testing",
       "priority": "high",
-      "description": "Validate that lerobot_train_craft.py can load policy and run 1 batch forward pass",
+      "description": "Validate that lerobot_train_craft.py can load policy and run complete training loop",
       "file": "src/lerobot/scripts/lerobot_train_craft.py",
-      "command": "python src/lerobot/scripts/lerobot_train_craft.py --policy.type=pi0_fast --dataset.repo_id=lerobot/aloha_sim_insertion_human --batch_size=8 --steps=1 --output_dir=outputs/craft_dryrun",
-      "expected_output": "DRY-RUN SUCCESSFUL! message with loss value",
+      "command": "bash scripts/train_craft_dryrun.sh",
+      "expected_output": "完整训练循环（3 步），包含任务损失和保留损失（如果提供 AnchorCache）",
       "dependencies": [
         "policy loading",
         "dataset loading",
-        "preprocessor setup"
-      ]
+        "preprocessor setup",
+        "AnchorCache loading (optional)"
+      ],
+      "notes": "完整训练流程已实现，包括双分支训练、梯度手术、原对偶优化"
     },
     {
       "id": "primal_dual_logic",
       "name": "Primal-Dual Optimization Logic",
-      "status": "not_started",
+      "status": "passing",
       "priority": "medium",
       "description": "Test epsilon scheduling and lambda update logic",
       "file": "tests/test_primal_dual.py",
@@ -53,7 +56,8 @@
       ],
       "dependencies": [
         "primal_dual.py implementation"
-      ]
+      ],
+      "notes": "primal_dual.py 已完整实现（epsilon_schedule, update_lambda）"
     },
     {
       "id": "retention_loss_computation",
@@ -93,8 +97,8 @@
     {
       "id": "craft_training_integration",
       "name": "CRaFT Training Integration Test",
-      "status": "not_started",
-      "priority": "low",
+      "status": "ready_for_testing",
+      "priority": "high",
       "description": "End-to-end test of CRaFT training with dual backward passes",
       "file": "tests/test_craft_training.py",
       "test_cases": [
@@ -106,7 +110,8 @@
       "dependencies": [
         "All CRaFT modules implemented",
         "lerobot_train_craft.py fully functional"
-      ]
+      ],
+      "notes": "所有依赖已完成，可以在真实数据集上进行端到端测试"
     }
   ],
   "implementation_phases": [
@@ -124,18 +129,18 @@
     {
       "phase": 2,
       "name": "Core Algorithms",
-      "status": "pending",
+      "status": "completed",
       "tasks": [
         "Implement grad_surgery.py functions",
         "Implement primal_dual.py functions",
-        "Implement retention_loss.py",
+        "Implement retention_loss.py (使用 policy.forward)",
         "Write unit tests for above"
       ]
     },
     {
       "phase": 3,
       "name": "Data Pipeline",
-      "status": "pending",
+      "status": "completed",
       "tasks": [
         "Implement anchor_cache.py",
         "Integrate anchor dataloader in train_craft",
@@ -145,7 +150,7 @@
     {
       "phase": 4,
       "name": "Training Loop",
-      "status": "pending",
+      "status": "completed",
       "tasks": [
         "Implement dual backward passes in update_policy_craft",
         "Implement gradient extraction and setting",
@@ -156,14 +161,33 @@
     {
       "phase": 5,
       "name": "Validation",
-      "status": "pending",
+      "status": "ready_for_testing",
       "tasks": [
-        "Run training on small dataset",
+        "Run training on small dataset (需要在服务器上测试)",
         "Verify retention constraint is enforced",
         "Compare with baseline training",
         "Performance profiling"
       ]
     }
+  ],
+  "completed_features": [
+    "完整的梯度手术算法（compute_dot, project_if_conflict, merge_grads）",
+    "完整的原对偶优化（epsilon_schedule, update_lambda）",
+    "完整的 CRaFT 训练循环（update_policy_craft, train_craft）",
+    "AnchorCache 离线生成和加载（build_anchor_cache.py, anchor_cache.py）",
+    "K-step 策略（每 K 步计算一次保留损失）",
+    "分布式训练支持（retention_loss 跨进程平均）",
+    "完整的日志记录（终端 + WandB）",
+    "检查点保存和恢复（包含 CRaFT 状态）",
+    "Lambda 历史导出（CSV 格式）",
+    "训练脚本和文档（train_craft.sh, CRAFT_TRAINING_GUIDE.md）"
+  ],
+  "next_steps": [
+    "在真实数据集上运行 build_anchor_cache.py",
+    "在小规模数据集上运行完整训练（steps=1000）",
+    "验证 λ 收敛行为和梯度冲突频率",
+    "对比 baseline 和 CRaFT 的性能",
+    "性能优化（如果训练速度过慢）"
   ],
   "notes": [
     "Baseline training (lerobot_train.py) must remain functional",
