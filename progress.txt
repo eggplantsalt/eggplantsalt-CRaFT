@@ -1,0 +1,156 @@
+# CRaFT Training Framework - Progress Tracker
+
+## 项目概览
+在 LeRobot 的 pi0_fast 训练流程中集成 CRaFT (Constrained Retention Fine-Tuning) 框架。
+
+## 关键文件路径
+
+### 训练入口
+- **Baseline 训练**: `src/lerobot/scripts/lerobot_train.py`
+  - 主函数: `train(cfg: TrainPipelineConfig)`
+  - 训练步函数: `update_policy()`
+  - 使用 Accelerator 进行分布式训练
+  - 支持 wandb 日志记录
+
+- **CRaFT 训练**: `src/lerobot/scripts/lerobot_train_craft.py` (新增)
+  - 主函数: `train_craft(cfg: TrainPipelineConfig)`
+  - 训练步函数: `update_policy_craft()`
+  - 复用 baseline 的配置解析和数据加载逻辑
+
+### Policy 实现 (pi0_fast)
+- **配置**: `src/lerobot/policies/pi0_fast/configuration_pi0_fast.py`
+  - 类: `PI0FastConfig`
+  - 关键参数: chunk_size=50, max_action_dim=32, max_state_dim=32
+
+- **模型**: `src/lerobot/policies/pi0_fast/modeling_pi0_fast.py`
+  - 类: `PI0FastPolicy` (继承自 PreTrainedPolicy)
+  - forward() 方法返回 (loss, output_dict)
+  - 基于 PaliGemma 的 VLA 架构
+
+- **处理器**: `src/lerobot/policies/pi0_fast/processor_pi0_fast.py`
+  - 数据预处理和后处理
+
+### CRaFT 模块 (新增)
+- **包路径**: `src/lerobot/craft/`
+- **配置**: `craft_config.py` - CraftConfig dataclass
+- **梯度手术**: `grad_surgery.py` - 梯度投影和合并
+- **原对偶优化**: `primal_dual.py` - λ 更新和 ε 调度
+- **保留损失**: `retention_loss.py` - 锚点数据损失计算
+- **锚点缓存**: `anchor_cache.py` - 锚点数据集加载
+
+### 测试
+- **单元测试**: `tests/test_grad_surgery_math.py` (新增)
+  - 梯度手术数学运算测试
+
+## 当前阶段完成情况
+
+### ✅ 已完成
+1. 仓库结构探索和关键文件定位
+2. craft 包创建，包含所有核心模块（函数签名和文档）
+3. lerobot_train_craft.py 训练入口脚本（dry-run 模式）
+4. 测试文件框架搭建
+5. 文档创建（progress.txt, tests.json）
+
+### 🚧 待实现（下一阶段）
+1. **anchor_cache.py**: 实现 AnchorCacheDataset 和 create_anchor_dataloader
+2. **retention_loss.py**: 实现 compute_retention_loss（调用 policy.forward）
+3. **grad_surgery.py**: 实现梯度点积、投影、合并算法
+4. **primal_dual.py**: 实现 epsilon_schedule 和 update_lambda
+5. **lerobot_train_craft.py**: 取消注释 TODO 部分，实现完整训练循环
+6. **test_grad_surgery_math.py**: 实现单元测试
+
+## 训练流程对比
+
+### Baseline (lerobot_train.py)
+```
+for step in range(cfg.steps):
+    batch = next(dataloader)
+    loss, output = policy.forward(batch)
+    accelerator.backward(loss)
+    optimizer.step()
+```
+
+### CRaFT (lerobot_train_craft.py)
+```
+for step in range(cfg.steps):
+    # 1. Task loss
+    task_batch = next(task_dataloader)
+    task_loss, output = policy.forward(task_batch)
+    accelerator.backward(task_loss)
+    grad_task = extract_gradients()
+    
+    # 2. Retention loss
+    anchor_batch = next(anchor_dataloader)
+    retention_loss = compute_retention_loss(policy, anchor_batch)
+    accelerator.backward(retention_loss)
+    grad_retain = extract_gradients()
+    
+    # 3. Gradient surgery
+    if use_projection:
+        grad_task, grad_retain = project_if_conflict(grad_task, grad_retain)
+    
+    # 4. Merge gradients
+    grad_final = merge_grads(grad_task, grad_retain, lambda_weight)
+    
+    # 5. Optimizer step
+    set_gradients(grad_final)
+    optimizer.step()
+    
+    # 6. Update lambda
+    epsilon = epsilon_schedule(step)
+    lambda_weight = update_lambda(lambda_weight, retention_loss, epsilon)
+```
+
+## 下一步计划
+
+### 优先级 1: 核心算法实现
+- [ ] 实现 grad_surgery.py 的三个函数（数学核心）
+- [ ] 实现 primal_dual.py 的两个函数（优化核心）
+- [ ] 实现 retention_loss.py（简单封装）
+
+### 优先级 2: 数据管道
+- [ ] 实现 anchor_cache.py（数据加载）
+- [ ] 在 train_craft 中集成锚点数据加载
+
+### 优先级 3: 训练循环
+- [ ] 在 update_policy_craft 中实现双向后传播
+- [ ] 实现梯度提取和设置逻辑
+- [ ] 集成梯度手术和 λ 更新
+
+### 优先级 4: 测试和验证
+- [ ] 实现单元测试
+- [ ] 在小数据集上运行完整训练
+- [ ] 验证保留约束是否生效
+
+## 验证命令
+
+### Dry-run 测试（当前可用）
+```bash
+python src/lerobot/scripts/lerobot_train_craft.py \
+    --policy.type=pi0_fast \
+    --dataset.repo_id=lerobot/aloha_sim_insertion_human \
+    --batch_size=8 \
+    --steps=1 \
+    --output_dir=outputs/craft_dryrun
+```
+
+### 完整训练（待实现后）
+```bash
+python src/lerobot/scripts/lerobot_train_craft.py \
+    --policy.type=pi0_fast \
+    --dataset.repo_id=lerobot/aloha_sim_insertion_human \
+    --batch_size=32 \
+    --steps=10000 \
+    --output_dir=outputs/craft_full \
+    --craft.anchor_dataset_path=path/to/anchor/data \
+    --craft.initial_lambda=1.0 \
+    --craft.epsilon_start=1.0 \
+    --craft.epsilon_end=0.1
+```
+
+## 注意事项
+1. **不修改 baseline**: lerobot_train.py 保持不变
+2. **不修改 policy**: pi0_fast 的 model/config/processor 不重写
+3. **模块化设计**: craft 包独立，易于测试和维护
+4. **渐进式开发**: 先 dry-run，再逐步实现完整功能
+

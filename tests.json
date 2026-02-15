@@ -1,0 +1,172 @@
+{
+  "test_suite": "CRaFT Training Framework",
+  "created": "2026-02-15",
+  "tests": [
+    {
+      "id": "grad_surgery_math",
+      "name": "Gradient Surgery Math Operations",
+      "status": "not_started",
+      "priority": "high",
+      "description": "Unit tests for gradient dot product, projection, and merging operations",
+      "file": "tests/test_grad_surgery_math.py",
+      "test_cases": [
+        "test_compute_dot_positive",
+        "test_compute_dot_negative",
+        "test_project_if_conflict_no_conflict",
+        "test_project_if_conflict_with_conflict",
+        "test_merge_grads_weighted",
+        "test_merge_grads_equal",
+        "test_gradient_surgery_end_to_end"
+      ],
+      "dependencies": [
+        "grad_surgery.py implementation"
+      ]
+    },
+    {
+      "id": "train_craft_dryrun",
+      "name": "CRaFT Training Dry-Run",
+      "status": "not_started",
+      "priority": "high",
+      "description": "Validate that lerobot_train_craft.py can load policy and run 1 batch forward pass",
+      "file": "src/lerobot/scripts/lerobot_train_craft.py",
+      "command": "python src/lerobot/scripts/lerobot_train_craft.py --policy.type=pi0_fast --dataset.repo_id=lerobot/aloha_sim_insertion_human --batch_size=8 --steps=1 --output_dir=outputs/craft_dryrun",
+      "expected_output": "DRY-RUN SUCCESSFUL! message with loss value",
+      "dependencies": [
+        "policy loading",
+        "dataset loading",
+        "preprocessor setup"
+      ]
+    },
+    {
+      "id": "primal_dual_logic",
+      "name": "Primal-Dual Optimization Logic",
+      "status": "not_started",
+      "priority": "medium",
+      "description": "Test epsilon scheduling and lambda update logic",
+      "file": "tests/test_primal_dual.py",
+      "test_cases": [
+        "test_epsilon_schedule_linear",
+        "test_epsilon_schedule_cosine",
+        "test_update_lambda_increase",
+        "test_update_lambda_decrease",
+        "test_lambda_clipping"
+      ],
+      "dependencies": [
+        "primal_dual.py implementation"
+      ]
+    },
+    {
+      "id": "retention_loss_computation",
+      "name": "Retention Loss Computation",
+      "status": "not_started",
+      "priority": "medium",
+      "description": "Test retention loss computation on anchor data",
+      "file": "tests/test_retention_loss.py",
+      "test_cases": [
+        "test_compute_retention_loss_basic",
+        "test_retention_loss_matches_policy_forward"
+      ],
+      "dependencies": [
+        "retention_loss.py implementation",
+        "anchor_cache.py implementation"
+      ]
+    },
+    {
+      "id": "anchor_dataloader",
+      "name": "Anchor Dataset Loading",
+      "status": "not_started",
+      "priority": "medium",
+      "description": "Test anchor dataset loading and batching",
+      "file": "tests/test_anchor_cache.py",
+      "test_cases": [
+        "test_anchor_dataset_creation",
+        "test_anchor_dataloader_iteration",
+        "test_anchor_batch_format"
+      ],
+      "dependencies": [
+        "anchor_cache.py implementation"
+      ]
+    },
+    {
+      "id": "craft_training_integration",
+      "name": "CRaFT Training Integration Test",
+      "status": "not_started",
+      "priority": "low",
+      "description": "End-to-end test of CRaFT training with dual backward passes",
+      "file": "tests/test_craft_training.py",
+      "test_cases": [
+        "test_update_policy_craft_single_step",
+        "test_lambda_updates_over_steps",
+        "test_gradient_surgery_applied",
+        "test_retention_constraint_enforced"
+      ],
+      "dependencies": [
+        "All CRaFT modules implemented",
+        "lerobot_train_craft.py fully functional"
+      ]
+    }
+  ],
+  "implementation_phases": [
+    {
+      "phase": 1,
+      "name": "Scaffold (Current)",
+      "status": "completed",
+      "tasks": [
+        "Create craft package structure",
+        "Create lerobot_train_craft.py with dry-run mode",
+        "Create test file skeletons",
+        "Document key file paths"
+      ]
+    },
+    {
+      "phase": 2,
+      "name": "Core Algorithms",
+      "status": "pending",
+      "tasks": [
+        "Implement grad_surgery.py functions",
+        "Implement primal_dual.py functions",
+        "Implement retention_loss.py",
+        "Write unit tests for above"
+      ]
+    },
+    {
+      "phase": 3,
+      "name": "Data Pipeline",
+      "status": "pending",
+      "tasks": [
+        "Implement anchor_cache.py",
+        "Integrate anchor dataloader in train_craft",
+        "Test anchor data loading"
+      ]
+    },
+    {
+      "phase": 4,
+      "name": "Training Loop",
+      "status": "pending",
+      "tasks": [
+        "Implement dual backward passes in update_policy_craft",
+        "Implement gradient extraction and setting",
+        "Integrate gradient surgery and lambda updates",
+        "Test full training loop"
+      ]
+    },
+    {
+      "phase": 5,
+      "name": "Validation",
+      "status": "pending",
+      "tasks": [
+        "Run training on small dataset",
+        "Verify retention constraint is enforced",
+        "Compare with baseline training",
+        "Performance profiling"
+      ]
+    }
+  ],
+  "notes": [
+    "Baseline training (lerobot_train.py) must remain functional",
+    "No modifications to pi0_fast policy implementation",
+    "CRaFT modules are independent and testable",
+    "Dry-run mode validates infrastructure before full implementation"
+  ]
+}
+
