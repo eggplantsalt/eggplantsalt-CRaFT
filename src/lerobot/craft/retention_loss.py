@@ -141,9 +141,9 @@ def compute_retention_loss_hidden(
     if teacher_hidden.device != student_hidden.device:
         teacher_hidden = teacher_hidden.to(student_hidden.device)
     
-    # 确保 teacher_hidden 的 dtype 与 student_hidden 一致
-    if teacher_hidden.dtype != student_hidden.dtype:
-        teacher_hidden = teacher_hidden.to(student_hidden.dtype)
+    # 转换到 float32 计算（更稳定）
+    student_hidden = student_hidden.float()
+    teacher_hidden = teacher_hidden.float()
     
     if loss_type == "mse":
         # MSE Loss: mean((student - teacher)^2)
@@ -352,6 +352,320 @@ def extract_student_hidden_with_pooling(
     return student_hidden
 
 
+def compute_hidden_retention_loss(
+    policy,
+    anchor_batch: dict,
+    craft_config,
+) -> tuple[Tensor, dict]:
+    """
+    计算 hidden state 保留损失（主入口函数）
+    
+    【功能说明】
+    这是 retention_mode=hidden 的主入口函数，负责：
+    1. 从 student 模型提取 hidden states
+    2. 与 anchor_batch 中的 target_features 比较
+    3. 计算 MSE 或 cosine loss
+    4. 返回 loss 和 metrics
+    
+    【参数】
+    policy: PreTrainedPolicy
+        Student 策略模型（例如 PI0FastPolicy）
+        
+    anchor_batch: dict
+        锚点数据批次，必须包含：
+        - pixel_values: [B, C, H, W]
+        - input_ids: [B, seq_len]
+        - attention_mask: [B, seq_len]
+        - target_features: [B, hidden_dim]  # Teacher pooled features
+        - meta: dict  # 包含 hidden_layer, pooling, dtype
+        
+    craft_config: CraftConfig
+        CRaFT 配置，包含：
+        - hidden_layer: 要提取的层索引（默认 -2）
+        - pooling: Pooling 策略（默认 mean_image_tokens）
+        - loss_type: 损失类型（mse 或 cosine）
+    
+    【返回值】
+    tuple[Tensor, dict]:
+        - loss: 保留损失标量张量（float32，稳定）
+        - metrics: 指标字典，包含：
+            - retention_loss: loss 值
+            - student_hidden_norm: student hidden states 的范数
+            - target_features_norm: target features 的范数
+    
+    【实现细节】
+    1. 使用 policy 原生的 output_hidden_states=True（优先）
+    2. 提取 craft_config.hidden_layer 指定的层
+    3. 使用与 cache 一致的 pooling 策略
+    4. 在 float32 中计算 loss（更稳定）
+    5. 支持反向传播
+    
+    【示例】
+    >>> from lerobot.craft.retention_loss import compute_hidden_retention_loss
+    >>> 
+    >>> # 在训练循环中
+    >>> anchor_batch = next(anchor_dl_iter)
+    >>> 
+    >>> # 计算 hidden retention loss
+    >>> retention_loss, metrics = compute_hidden_retention_loss(
+    ...     policy,
+    ...     anchor_batch,
+    ...     craft_config
+    ... )
+    >>> 
+    >>> # 反向传播
+    >>> retention_loss.backward()
+    >>> 
+    >>> # 记录 metrics
+    >>> print(f"Retention Loss: {metrics['retention_loss']:.4f}")
+    """
+    # 检查 anchor_batch 格式
+    if "target_features" not in anchor_batch:
+        raise ValueError(
+            "anchor_batch 必须包含 'target_features' 字段。"
+            "请使用 build_anchor_hidden_cache.py 生成 hidden feature cache。"
+        )
+    
+    # 提取 student hidden features
+    student_features = extract_student_hidden_features(
+        policy,
+        anchor_batch,
+        craft_config,
+    )
+    
+    # 获取 target features
+    target_features = anchor_batch["target_features"]
+    
+    # 确保在相同设备和 dtype
+    if target_features.device != student_features.device:
+        target_features = target_features.to(student_features.device)
+    
+    # 转换到 float32 计算（更稳定）
+    student_features_f32 = student_features.float()
+    target_features_f32 = target_features.float()
+    
+    # 计算 loss
+    loss_type = getattr(craft_config, "loss_type", "mse")
+    
+    if loss_type == "mse":
+        loss = F.mse_loss(student_features_f32, target_features_f32, reduction="mean")
+    elif loss_type == "cosine":
+        # Cosine similarity loss: 1 - cosine_similarity
+        cosine_sim = F.cosine_similarity(student_features_f32, target_features_f32, dim=1)
+        loss = (1.0 - cosine_sim).mean()
+    else:
+        raise ValueError(f"Unknown loss_type: {loss_type}. Must be 'mse' or 'cosine'")
+    
+    # 计算 metrics
+    metrics = {
+        "retention_loss": loss.item(),
+        "student_hidden_norm": student_features_f32.norm(dim=1).mean().item(),
+        "target_features_norm": target_features_f32.norm(dim=1).mean().item(),
+    }
+    
+    return loss, metrics
+
+
+def extract_student_hidden_features(
+    policy,
+    anchor_batch: dict,
+    craft_config,
+) -> Tensor:
+    """
+    从 student 模型提取 hidden features（与 teacher 相同的 pooling 策略）
+    
+    【功能说明】
+    运行 student forward pass，提取指定层的 hidden states，并按照
+    anchor_batch["meta"] 中的 pooling 策略进行 pooling。
+    
+    【参数】
+    policy: PreTrainedPolicy
+        Student 策略模型
+        
+    anchor_batch: dict
+        锚点数据批次，包含：
+        - pixel_values: [B, C, H, W]
+        - input_ids: [B, seq_len]
+        - attention_mask: [B, seq_len]
+        - meta: dict  # 包含 hidden_layer, pooling
+        
+    craft_config: CraftConfig
+        CRaFT 配置
+    
+    【返回值】
+    Tensor: Student hidden features [B, hidden_dim]
+    
+    【实现策略】
+    1. 优先使用模型原生的 output_hidden_states=True
+    2. 提取 meta["hidden_layer"] 指定的层
+    3. 使用 meta["pooling"] 指定的 pooling 策略
+    4. 返回 pooled features
+    """
+    device = next(policy.parameters()).device
+    
+    # 准备输入
+    pixel_values = anchor_batch["pixel_values"].to(device)
+    input_ids = anchor_batch["input_ids"].to(device)
+    attention_mask = anchor_batch["attention_mask"].to(device)
+    
+    # 获取 meta 信息
+    meta = anchor_batch["meta"]
+    hidden_layer = meta.get("hidden_layer", -2)
+    pooling = meta.get("pooling", "mean_image_tokens")
+    
+    # 使用模型原生的 output_hidden_states
+    # 对于 PI0FastPolicy，需要访问底层的 language_model
+    try:
+        # 尝试使用 _paligemma_model（如果存在）
+        if hasattr(policy, '_paligemma_model'):
+            outputs = policy._paligemma_model(
+                pixel_values=pixel_values,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+            )
+            all_hidden_states = outputs.hidden_states
+        else:
+            # Fallback: 手动构造 forward pass
+            bsize = pixel_values.shape[0]
+            
+            # 准备图像输入
+            images = [pixel_values]
+            img_masks = [torch.ones(bsize, dtype=torch.bool, device=device)]
+            
+            # 添加 BOS token
+            bos_token = torch.full(
+                (bsize, 1), policy._paligemma_tokenizer.bos_token_id, dtype=torch.long, device=device
+            )
+            tokens = torch.cat([input_ids, bos_token], dim=1)
+            masks = torch.cat([attention_mask, torch.ones((bsize, 1), dtype=torch.bool, device=device)], dim=1)
+            
+            # Embed prefix
+            prefix_embs, prefix_pad_masks, prefix_att_masks, total_t_images, _ = (
+                policy.model.embed_prefix_fast(
+                    images, img_masks, tokens, masks,
+                    fast_action_tokens=None,
+                    fast_action_masks=None,
+                )
+            )
+            
+            if policy.model.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype == torch.bfloat16:
+                prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
+            
+            # Forward pass
+            position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+            att_4d = policy.model._prepare_attention_masks_4d(prefix_att_masks, dtype=prefix_embs.dtype)
+            
+            language_model = policy.model.paligemma_with_expert.paligemma.language_model
+            outputs = language_model.forward(
+                inputs_embeds=prefix_embs,
+                attention_mask=att_4d,
+                position_ids=position_ids,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            all_hidden_states = outputs.hidden_states
+    except Exception as e:
+        raise RuntimeError(f"无法提取 hidden states: {e}")
+    
+    # 提取指定层的 hidden states
+    total_layers = len(all_hidden_states) - 1
+    if hidden_layer < 0:
+        actual_idx = total_layers + hidden_layer + 1
+    else:
+        actual_idx = hidden_layer + 1
+    
+    if not (0 <= actual_idx < len(all_hidden_states)):
+        raise ValueError(f"Invalid hidden_layer: {hidden_layer} (total layers: {total_layers})")
+    
+    hidden_state = all_hidden_states[actual_idx]  # [B, seq_len, hidden_dim]
+    
+    # Pooling
+    pooled_features = pool_hidden_states(
+        hidden_state,
+        attention_mask,
+        pooling,
+        policy,
+        input_ids,
+    )
+    
+    return pooled_features
+
+
+def pool_hidden_states(
+    hidden_states: Tensor,
+    attention_mask: Tensor,
+    pooling: str,
+    policy,
+    input_ids: Tensor,
+) -> Tensor:
+    """
+    对 hidden states 进行 pooling
+    
+    【参数】
+    hidden_states: [B, seq_len, hidden_dim]
+    attention_mask: [B, seq_len]
+    pooling: Pooling 策略
+    policy: Policy 实例（用于识别图像 tokens）
+    input_ids: [B, seq_len]
+    
+    【返回值】
+    pooled_features: [B, hidden_dim]
+    """
+    B, seq_len, hidden_dim = hidden_states.shape
+    
+    if pooling == "mean_image_tokens":
+        # 识别图像 tokens 范围
+        num_image_tokens = identify_image_tokens(policy)
+        
+        # 提取图像 tokens 的 hidden states
+        image_hidden = hidden_states[:, :num_image_tokens, :]  # [B, num_image_tokens, hidden_dim]
+        
+        # 平均池化
+        pooled = image_hidden.mean(dim=1)  # [B, hidden_dim]
+        
+    elif pooling == "mean_masked":
+        # 对所有非 padding tokens 取平均
+        mask = attention_mask.unsqueeze(-1).float()  # [B, seq_len, 1]
+        masked_hidden = hidden_states * mask
+        pooled = masked_hidden.sum(dim=1) / (mask.sum(dim=1) + 1e-9)  # [B, hidden_dim]
+        
+    elif pooling == "last_token":
+        # 取最后一个非 padding token
+        lengths = attention_mask.sum(dim=1).long() - 1  # [B]
+        pooled = hidden_states[torch.arange(B, device=hidden_states.device), lengths]  # [B, hidden_dim]
+        
+    elif pooling == "cls_token":
+        # 取第一个 token（假设是 CLS）
+        pooled = hidden_states[:, 0, :]  # [B, hidden_dim]
+        
+    else:
+        raise ValueError(f"Unknown pooling strategy: {pooling}")
+    
+    return pooled
+
+
+def identify_image_tokens(policy) -> int:
+    """
+    识别图像 tokens 的数量
+    
+    【返回值】
+    int: 图像 tokens 数量
+    """
+    # 方法 1: 从 policy config 获取
+    if hasattr(policy, 'config') and hasattr(policy.config, 'image_seq_length'):
+        return policy.config.image_seq_length
+    
+    # 方法 2: 计算
+    if hasattr(policy, 'config') and hasattr(policy.config, 'image_resolution') and hasattr(policy.config, 'patch_size'):
+        h, w = policy.config.image_resolution
+        patch_size = policy.config.patch_size
+        return (h // patch_size) * (w // patch_size)
+    
+    # 方法 3: 默认值（PaliGemma 224x224, patch_size=16）
+    return 196
+
+
 # 向后兼容：保留旧的 token-level 函数签名（但标记为 deprecated）
 def compute_retention_loss(
     policy,
@@ -362,8 +676,8 @@ def compute_retention_loss(
     在锚点数据批次上计算保留损失（Token-level，已弃用）
     
     【警告】
-    此函数用于 token-level distillation，已被 compute_retention_loss_hidden 替代。
-    如果 anchor_batch 包含 teacher_hidden，请使用 compute_retention_loss_hidden。
+    此函数用于 token-level distillation，已被 compute_hidden_retention_loss 替代。
+    如果 anchor_batch 包含 target_features，请使用 compute_hidden_retention_loss。
     
     【功能说明】
     直接调用 policy.forward() 方法计算 token-level CE loss。
@@ -379,10 +693,10 @@ def compute_retention_loss(
     【返回值】
     Tensor: 保留损失标量张量
     """
-    # 检查是否为 hidden state anchoring
-    if "teacher_hidden" in anchor_batch:
+    # 检查是否为 hidden feature anchoring
+    if "target_features" in anchor_batch:
         raise ValueError(
-            "检测到 hidden state anchoring cache，请使用 compute_retention_loss_hidden() "
+            "检测到 hidden feature anchoring cache，请使用 compute_hidden_retention_loss() "
             "而非 compute_retention_loss()"
         )
     
