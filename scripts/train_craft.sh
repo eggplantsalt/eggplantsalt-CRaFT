@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# CRaFT 训练启动脚本
+# CRaFT 训练启动脚本（使用 Hidden Retention）
 # 用法: bash scripts/train_craft.sh
 
 # ============================================================================
@@ -10,7 +10,7 @@
 # 基础训练配置
 DATASET="lerobot/aloha_sim_insertion_human"
 POLICY_PATH="lerobot/pi0_fast"
-OUTPUT_DIR="outputs/craft_train"
+OUTPUT_DIR="outputs/craft_train_hidden"
 STEPS=1000
 BATCH_SIZE=8
 EVAL_FREQ=500
@@ -18,7 +18,8 @@ LOG_FREQ=50
 
 # CRaFT 配置
 CRAFT_ENABLED=true
-ANCHOR_CACHE_DIR="data/anchor_cache"  # 由 build_anchor_cache.py 生成
+RETENTION_MODE="hidden"  # "hidden" 或 "token_ce"
+ANCHOR_CACHE_DIR="data/anchor_hidden_cache"  # 由 build_anchor_hidden_cache.py 生成
 ANCHOR_BATCH_SIZE=8
 RETENTION_FREQ=5  # K-step: 每 5 步计算一次保留损失
 INITIAL_LAMBDA=1.0
@@ -35,7 +36,7 @@ PROJECTION_MODE="weighted"
 # ============================================================================
 
 echo "=========================================="
-echo "CRaFT 训练"
+echo "CRaFT 训练 (Hidden Retention)"
 echo "=========================================="
 echo "数据集: $DATASET"
 echo "策略: $POLICY_PATH"
@@ -43,6 +44,7 @@ echo "输出目录: $OUTPUT_DIR"
 echo "训练步数: $STEPS"
 echo "CRaFT 启用: $CRAFT_ENABLED"
 if [ "$CRAFT_ENABLED" = true ]; then
+    echo "Retention Mode: $RETENTION_MODE"
     echo "AnchorCache: $ANCHOR_CACHE_DIR"
     echo "保留频率: 每 $RETENTION_FREQ 步"
     echo "初始 λ: $INITIAL_LAMBDA"
@@ -59,10 +61,20 @@ python -m lerobot.scripts.lerobot_train_craft \
     --log_freq=$LOG_FREQ \
     --save_freq=500 \
     --num_workers=4 \
-    --wandb.enable=false
-
-# 注意：CRaFT 配置目前通过代码传递
-# 未来可以扩展为命令行参数
+    --wandb.enable=false \
+    craft.enabled=$CRAFT_ENABLED \
+    craft.retention_mode=$RETENTION_MODE \
+    craft.anchor_cache_dir=$ANCHOR_CACHE_DIR \
+    craft.anchor_batch_size=$ANCHOR_BATCH_SIZE \
+    craft.retention_freq=$RETENTION_FREQ \
+    craft.initial_lambda=$INITIAL_LAMBDA \
+    craft.lambda_lr=$LAMBDA_LR \
+    craft.lambda_max=$LAMBDA_MAX \
+    craft.epsilon_start=$EPSILON_START \
+    craft.epsilon_end=$EPSILON_END \
+    craft.use_grad_projection=$USE_GRAD_PROJECTION \
+    craft.conflict_threshold=$CONFLICT_THRESHOLD \
+    craft.projection_mode=$PROJECTION_MODE
 
 echo ""
 echo "=========================================="

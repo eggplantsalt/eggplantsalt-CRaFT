@@ -157,50 +157,60 @@ def update_policy_craft(
     grad_dot_product = None
     
     if anchor_batch is not None and craft_config.enabled:
-        # 检测 cache 类型
-        is_hidden_state_cache = "teacher_hidden" in anchor_batch
+        # 根据 retention_mode 选择计算方式
+        retention_mode = getattr(craft_config, "retention_mode", "hidden")
         
-        if is_hidden_state_cache:
+        if retention_mode == "hidden":
             # ========================================================================
-            # Hidden State Anchoring（新版本）
+            # Hidden Retention Loss（推荐）
             # ========================================================================
+            # 检测 cache 类型
+            if "target_features" not in anchor_batch:
+                raise ValueError(
+                    f"retention_mode=hidden 需要 hidden feature cache，"
+                    f"但 anchor_batch 不包含 'target_features'。"
+                    f"请使用 build_anchor_hidden_cache.py 生成 cache。"
+                )
+            
             # 清零梯度，准备第二次反向传播
             optimizer.zero_grad()
             
-            # 提取 student hidden states
-            meta = anchor_batch["meta"]
-            layers_to_extract = meta["layers_to_save"]
+            # 导入 hidden retention loss 函数
+            from lerobot.craft.retention_loss import compute_hidden_retention_loss
             
             with accelerator.autocast():
-                student_hidden = extract_student_hidden_with_pooling(
+                # 计算 hidden retention loss
+                retention_loss, metrics = compute_hidden_retention_loss(
                     policy,
                     anchor_batch,
-                    layers_to_extract,
-                    meta,
-                )
-                
-                # 计算 hidden state retention loss
-                teacher_hidden = anchor_batch["teacher_hidden"].to(student_hidden.device)
-                retention_loss = compute_retention_loss_hidden(
-                    student_hidden,
-                    teacher_hidden,
-                    loss_type="mse",  # 可配置
-                    reduction="mean",
+                    craft_config,
                 )
             
             # 第二次反向传播：计算保留梯度
             accelerator.backward(retention_loss)
             
-        else:
+        elif retention_mode == "token_ce":
             # ========================================================================
-            # Token-level Distillation（旧版本，向后兼容）
+            # Token-level CE Loss（旧版本，向后兼容）
             # ========================================================================
+            # 检测 cache 类型
+            if "labels" not in anchor_batch:
+                raise ValueError(
+                    f"retention_mode=token_ce 需要 token-level cache，"
+                    f"但 anchor_batch 不包含 'labels'。"
+                    f"请使用 build_anchor_cache.py 生成 token-level cache。"
+                )
+            
+            # 清零梯度，准备第二次反向传播
             optimizer.zero_grad()
             
             with accelerator.autocast():
                 retention_loss, _ = policy.forward(anchor_batch)
             
             accelerator.backward(retention_loss)
+            
+        else:
+            raise ValueError(f"Unknown retention_mode: {retention_mode}")
         
         # 保存保留梯度
         retention_grads = [
@@ -277,7 +287,7 @@ def update_policy_craft(
         output_dict["lambda"] = current_lambda
         output_dict["epsilon"] = current_epsilon
         output_dict["grad_conflict"] = 1.0 if grad_conflict_detected else 0.0
-        output_dict["cache_type"] = "hidden_state" if is_hidden_state_cache else "token_level"
+        output_dict["retention_mode"] = retention_mode
         if grad_dot_product is not None:
             output_dict["grad_dot"] = grad_dot_product
         if grad_cos is not None:
@@ -616,6 +626,7 @@ def train_craft(
         logging.info(colored("=" * 80, "cyan"))
         logging.info(f"CRaFT 启用: {craft_config.enabled}")
         if craft_config.enabled:
+            logging.info(f"Retention Mode: {craft_config.retention_mode}")
             logging.info(f"初始 λ: {current_lambda}")
             logging.info(f"λ 学习率: {craft_config.lambda_lr}")
             logging.info(f"λ 最大值: {craft_config.lambda_max}")
@@ -708,6 +719,7 @@ def train_craft(
             
             # CRaFT 特定指标
             if craft_config.enabled and "retention_loss" in output_dict:
+                log_msg += f" | mode={output_dict.get('retention_mode', 'N/A')}"
                 log_msg += f" | L_ret={output_dict['retention_loss']:.3f}"
                 log_msg += f" | λ={current_lambda:.3f}"
                 log_msg += f" | ε={current_epsilon:.3f}"

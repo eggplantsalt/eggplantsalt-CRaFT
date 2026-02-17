@@ -92,6 +92,11 @@ class CraftConfig:
         - 5: 每 5 步计算一次（推荐，平衡效率和效果）
         - 10+: 更少计算（节省时间但可能效果差）
     
+    retention_mode: str = "hidden"
+        保留损失计算模式
+        - "token_ce": Token-level cross-entropy loss（旧版本，向后兼容）
+        - "hidden": Hidden state retention loss（推荐，使用 compute_hidden_retention_loss）
+    
     ## 损失权重（原对偶优化）
     initial_lambda: float = 1.0
         Lagrangian 乘子 λ 的初始值
@@ -151,6 +156,7 @@ class CraftConfig:
     anchor_cache_dir: str = ""
     anchor_batch_size: int = 16
     retention_freq: int = 5  # K-step: 每 K 步计算一次保留损失
+    retention_mode: str = "hidden"  # "token_ce" 或 "hidden"
     
     # ========== 损失权重（原对偶优化）==========
     initial_lambda: float = 1.0
@@ -202,5 +208,11 @@ class CraftConfig:
             raise ValueError(
                 f"projection_mode 必须是 ['weighted', 'equal', 'task_priority'] 之一，"
                 f"得到 {self.projection_mode}"
+            )
+        
+        if self.retention_mode not in ["token_ce", "hidden"]:
+            raise ValueError(
+                f"retention_mode 必须是 ['token_ce', 'hidden'] 之一，"
+                f"得到 {self.retention_mode}"
             )
 

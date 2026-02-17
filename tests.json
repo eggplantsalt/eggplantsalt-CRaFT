@@ -25,20 +25,25 @@
     },
     {
       "id": "train_craft_dryrun",
-      "name": "CRaFT Training Dry-Run",
-      "status": "ready_for_testing",
+      "name": "CRaFT Training Dry-Run with Hidden Retention",
+      "status": "passing",
       "priority": "high",
-      "description": "Validate that lerobot_train_craft.py can load policy and run complete training loop",
+      "description": "Validate that lerobot_train_craft.py can run with retention_mode=hidden",
       "file": "src/lerobot/scripts/lerobot_train_craft.py",
-      "command": "bash scripts/train_craft_dryrun.sh",
-      "expected_output": "完整训练循环（3 步），包含任务损失和保留损失（如果提供 AnchorCache）",
+      "command": "python -m lerobot.scripts.lerobot_train_craft --dataset.repo_id=lerobot/aloha_sim_insertion_human --policy.path=lerobot/pi0_fast --output_dir=outputs/craft_hidden_test --steps=3 --batch_size=2 --eval_freq=0 --save_checkpoint=false --num_workers=0 craft.enabled=true craft.retention_mode=hidden craft.anchor_cache_dir=data/anchor_hidden_cache",
+      "expected_output": [
+        "Retention Mode: hidden",
+        "mode=hidden | L_ret=X.XXX",
+        "λ=X.XXX | ε=X.XXX",
+        "dot=X.XXX | cos=X.XXX"
+      ],
       "dependencies": [
         "policy loading",
         "dataset loading",
         "preprocessor setup",
-        "AnchorCache loading (optional)"
+        "Hidden feature cache (build_anchor_hidden_cache.py)"
       ],
-      "notes": "完整训练流程已实现，包括双分支训练、梯度手术、原对偶优化"
+      "notes": "完整训练流程已实现，包括 hidden retention loss、梯度手术、原对偶优化"
     },
     {
       "id": "primal_dual_logic",
