@@ -22,19 +22,33 @@
 管理离线生成的 AnchorCache 的加载和采样，用于 CRaFT 训练中的保留损失计算。
 
 【AnchorCache 格式】
-由 build_anchor_cache.py 生成的 .pt shard 文件，每个包含：
+支持三种格式的 cache：
+
+1. Token-level cache（旧版本）：
 {
-    "pixel_values": Tensor[B, C, H, W],  # 图像，float32，已归一化到 [-1, 1]
-    "input_ids": Tensor[B, seq_len],     # 完整输入序列（prompt + BOS）
-    "attention_mask": Tensor[B, seq_len], # 注意力掩码
-    "teacher_hidden": Tensor[B, n_layers, n_vecs, hidden_dim],  # Teacher hidden states
-    "meta": dict,  # 元数据：layers, pooling 策略等
-    "prompts": List[str],  # Prompt 字符串（用于调试）
+    "pixel_values": Tensor[B, C, H, W],
+    "input_ids": Tensor[B, seq_len],
+    "attention_mask": Tensor[B, seq_len],
+    "labels": Tensor[B, seq_len],  # Teacher 生成的 tokens
 }
 
-【与 Token-level 版本的区别】
-- 旧版本：包含 labels（teacher 生成的 tokens）
-- 新版本：包含 teacher_hidden（teacher 的 hidden states）
+2. Hidden state cache（多层多向量）：
+{
+    "pixel_values": Tensor[B, C, H, W],
+    "input_ids": Tensor[B, seq_len],
+    "attention_mask": Tensor[B, seq_len],
+    "teacher_hidden": Tensor[B, n_layers, n_vecs, hidden_dim],
+    "meta": dict,  # layers, pooling 策略等
+}
+
+3. Hidden feature cache（单个 pooled vector）：
+{
+    "pixel_values": Tensor[B, C, H, W],
+    "input_ids": Tensor[B, seq_len],
+    "attention_mask": Tensor[B, seq_len],
+    "target_features": Tensor[B, hidden_dim],  # Pooled features
+    "meta": dict,  # hidden_layer, pooling, dtype
+}
 
 【使用示例】
 ```python
@@ -81,16 +95,17 @@ class AnchorCacheDataset(Dataset):
     从离线生成的 AnchorCache shards 中加载数据，用于 CRaFT 训练的保留损失计算。
     
     【数据格式】
-    每个样本包含：
+    根据 cache 类型，每个样本包含不同字段：
+    
+    基础字段（所有类型都有）：
     - pixel_values: Tensor[C, H, W], 图像，float32，[-1, 1]
     - input_ids: Tensor[seq_len], 完整输入序列
     - attention_mask: Tensor[seq_len], 注意力掩码
-    - teacher_hidden: Tensor[n_layers, n_vecs, hidden_dim], Teacher hidden states
-    - meta: dict, 元数据（layers, pooling 策略等）
     
-    【向后兼容】
-    如果 cache 是旧版本（token-level），则包含：
-    - labels: Tensor[seq_len], 标签（prompt=-100, suffix=token_ids）
+    类型特定字段：
+    - Token-level: labels (Tensor[seq_len])
+    - Hidden state: teacher_hidden (Tensor[n_layers, n_vecs, hidden_dim]), meta (dict)
+    - Hidden feature: target_features (Tensor[hidden_dim]), meta (dict)
     
     【参数】
     cache_dir: str | Path
@@ -210,15 +225,19 @@ class AnchorCacheDataset(Dataset):
         }
         
         # 检测 cache 类型并添加相应字段
-        if "teacher_hidden" in shard_data:
-            # Hidden state anchoring（新版本）
+        if "target_features" in shard_data:
+            # Hidden feature cache（pooled vector）
+            sample["target_features"] = shard_data["target_features"][local_idx]
+            sample["meta"] = shard_data["meta"]
+        elif "teacher_hidden" in shard_data:
+            # Hidden state cache（多层多向量）
             sample["teacher_hidden"] = shard_data["teacher_hidden"][local_idx]
             sample["meta"] = shard_data["meta"]
         elif "labels" in shard_data:
-            # Token-level distillation（旧版本，向后兼容）
+            # Token-level cache（旧版本，向后兼容）
             sample["labels"] = shard_data["labels"][local_idx]
         else:
-            raise ValueError("AnchorCache 格式错误：既没有 teacher_hidden 也没有 labels")
+            raise ValueError("AnchorCache 格式错误：没有 target_features、teacher_hidden 或 labels")
         
         return sample
 
