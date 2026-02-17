@@ -1,100 +1,112 @@
 # CRaFT 项目进度 - Hidden State Anchoring 版本
 
-## 最新更新：Hidden State Anchoring 实现（2025-02-17）
+## 最新更新：修复 CRaFT 训练关键 Bug（2025-02-17）
 
-### 改动概述
+### 修复内容
 
-将 CRaFT 的 retention 分支从 token-level teacher distillation 改为 hidden-state anchoring（表征蒸馏），解决 π0_fast 不稳定输出自然语言的问题。
+**问题 1：AnchorCache 加载时 preprocessor 未创建**
+- 原因：在 preprocessor 创建前尝试传递给 AnchorCacheDataset
+- 修复：
+  - 将 AnchorCache 加载移到 preprocessor 创建之后
+  - AnchorCacheDataset 不再接受 transform 参数，返回 raw batch
+  - 在训练循环中对 anchor_batch 调用 preprocessor(anchor_batch)
+- 验证：启用 craft.enabled=true 且提供 anchor_cache_dir 时，不会触发 try/except 导致 craft_config.enabled=False
 
-### 核心改动
+**问题 2：梯度冲突日志错误**
+- 原因：输出的是 dot product，却打印成 cos（余弦相似度）
+- 修复：
+  - 实现并记录两个值：grad_dot（点积）和 grad_cos（余弦相似度）
+  - grad_cos = dot / (sqrt(norm_sq_task) * sqrt(norm_sq_ret) + 1e-12)
+  - 日志同时显示：`dot=X.XXX | cos=X.XXX`
+- 验证：日志中同时显示 dot 和 cos 两个指标
 
-1. **build_anchor_cache.py**（完全重写）
-   - 不再保存 teacher tokens/labels
-   - 改为保存 teacher hidden states（最后两层）
-   - Pooling 策略：vision_token_mean + text_token_last
-   - Cache 大小减少 ~60 倍
+**问题 3：dot product 计算错位**
+- 原因：使用"过滤 None 后两列表直接 dot"会导致位置不对应
+- 修复：
+  - 使用 zip(task_grads, ret_grads) 同位置配对
+  - 累加 dot 时跳过任一为 None 的项
+  - 确保参数级别的梯度正确对应
+- 验证：梯度手术逻辑正确，不会因错位导致投影错误
 
-2. **anchor_cache.py**（更新）
-   - 自动检测 cache 类型（hidden-state 或 token-level）
-   - 向后兼容旧版本 token-level cache
+### 如何验证 CRaFT 确实启用
 
-3. **retention_loss.py**（完全重写）
-   - 新增 `compute_retention_loss_hidden()`：支持 MSE/Cosine/L1 loss
-   - 新增 `extract_student_hidden_with_pooling()`：提取 student hidden states
-   - 保留 `compute_retention_loss()` 用于向后兼容
-
-4. **lerobot_train_craft.py**（更新）
-   - `update_policy_craft()` 自动检测 cache 类型
-   - 支持 hidden state anchoring 和 token-level distillation
-   - 日志显示 cache_type
-
-5. **测试**
-   - 新增 `tests/test_hidden_state_anchoring.py`（5 个单元测试）
-
-### 使用方法
-
-#### 生成 Hidden State AnchorCache
-
-```bash
-python -m lerobot.scripts.build_anchor_cache \
-    --policy.pretrained_path=physical-intelligence/pi0-fast \
-    --dataset.repo_id=lerobot/aloha_sim_insertion_human \
-    --out_dir=data/anchor_cache_hidden \
-    --num_anchors=1000 \
-    --layers_to_save=-2,-1
+**关键日志（必须出现）：**
+```
+✓ AnchorCache 加载成功: XXXX 样本
+✓ CRaFT 已启用，将在训练中计算保留损失
 ```
 
-#### 训练（自动检测 cache 类型）
-
-```bash
-python -m lerobot.scripts.lerobot_train_craft \
-    --dataset.repo_id=lerobot/aloha_sim_insertion_human \
-    --policy.path=lerobot/pi0_fast \
-    --output_dir=outputs/craft_hidden \
-    --steps=1000 \
-    --batch_size=8
+**训练日志（每 K 步出现）：**
+```
+Step X/XXX | ... | L_ret=X.XXX | λ=X.XXX | ε=X.XXX | dot=X.XXX | cos=X.XXX
 ```
 
-#### Dry-Run 测试
-
-```bash
-python -m lerobot.scripts.lerobot_train_craft \
-    --dataset.repo_id=lerobot/aloha_sim_insertion_human \
-    --policy.path=lerobot/pi0_fast \
-    --output_dir=outputs/craft_dryrun \
-    --steps=2 \
-    --batch_size=2 \
-    --eval_freq=0 \
-    --save_checkpoint=false \
-    --num_workers=0
+**失败标志（不应出现）：**
+```
+⚠ AnchorCache 加载失败
+将以 baseline 模式运行（无保留损失）
 ```
 
-### 验收标准
+**验证条件：**
+1. craft.enabled=true 在配置中
+2. craft.anchor_cache_dir 指向有效的 cache 目录
+3. 日志显示"✓ CRaFT 已启用"
+4. 训练日志包含 L_ret、λ、ε、dot、cos 指标
 
-- ✅ Baseline 训练脚本不被破坏
-- ✅ 旧版本 token-level cache 仍可使用
-- ✅ 新版本 hidden state cache 正确加载
-- ✅ K-step 时能完成 L_ret backward、grad surgery、λ update
-- ✅ 单元测试通过
+### 修改文件列表
+
+1. `src/lerobot/scripts/lerobot_train_craft.py`
+   - 移动 AnchorCache 加载到 preprocessor 创建后
+   - 在训练循环中对 anchor_batch 应用 preprocessor
+   - 实现 grad_dot 和 grad_cos 两个指标
+   - 修复 compute_dot 调用（使用 zip 同位置配对）
+   - 更新日志输出（同时显示 dot 和 cos）
+
+2. `src/lerobot/craft/grad_surgery.py`
+   - 修复 compute_dot() 实现
+   - 使用 zip 同位置配对，避免错位
+   - 跳过任一为 None 的梯度项
+
+3. `tests.json`
+   - 新增 craft_enabled_smoke 测试条目
+   - 状态：in_progress
+   - 包含验证条件和失败标志
+
+4. `progress.txt`
+   - 记录本次修复的三个问题
+   - 添加验证方法说明
 
 ### Git Commit
 
-```
-commit: feat: switch retention to hidden-state anchoring (offline teacher cache)
+```bash
+git add src/lerobot/scripts/lerobot_train_craft.py
+git add src/lerobot/craft/grad_surgery.py
+git add tests.json
+git add progress.txt
+git commit -m "fix: ensure craft anchor loading works; correct grad conflict logging
 
-Changes:
-- src/lerobot/scripts/build_anchor_cache.py (完全重写)
-- src/lerobot/craft/anchor_cache.py (更新)
-- src/lerobot/craft/retention_loss.py (完全重写)
-- src/lerobot/scripts/lerobot_train_craft.py (更新)
-- tests/test_hidden_state_anchoring.py (新增)
-- HIDDEN_STATE_ANCHORING_GUIDE.md (新增)
-- progress.txt (更新)
+- Fix: Move AnchorCache loading after preprocessor creation
+- Fix: Apply preprocessor to anchor_batch in train loop (not in dataset)
+- Fix: Implement both grad_dot and grad_cos metrics (was printing dot as cos)
+- Fix: Use zip() for gradient dot product to avoid misalignment
+- Add: craft_enabled_smoke test in tests.json
+- Update: progress.txt with verification instructions"
 ```
 
 ---
 
 ## 历史记录
+
+### 第五阶段：Hidden State Anchoring 实现（已完成，2025-02-17）
+
+**目标：** 将 retention 分支从 token-level distillation 改为 hidden-state anchoring。
+
+**完成内容：**
+1. build_anchor_cache.py（完全重写）
+2. retention_loss.py（完全重写）
+3. anchor_cache.py（更新，向后兼容）
+4. lerobot_train_craft.py（更新，自动检测 cache 类型）
+5. test_hidden_state_anchoring.py（新增）
 
 ### 第四阶段：CRaFT 训练核心算法实现（已完成，2025-02-15）
 
@@ -133,14 +145,14 @@ Changes:
 src/lerobot/craft/
 ├── __init__.py
 ├── craft_config.py
-├── grad_surgery.py
+├── grad_surgery.py          # 修复：compute_dot 使用 zip 同位置配对
 ├── primal_dual.py
 ├── anchor_cache.py
 ├── retention_loss.py
 
 src/lerobot/scripts/
 ├── build_anchor_cache.py
-└── lerobot_train_craft.py
+└── lerobot_train_craft.py   # 修复：preprocessor 顺序、梯度日志、anchor_batch 预处理
 
 tests/
 ├── test_anchor_cache.py
@@ -162,7 +174,8 @@ docs/
 
 ## 下一步
 
-1. 在真实数据集上测试 hidden state anchoring
-2. 对比 hidden state vs token-level 的性能
-3. 更新所有文档以反映 hidden state anchoring
-4. 性能优化和超参数调优
+1. 在服务器上运行 craft_enabled_smoke 测试
+2. 验证 CRaFT 确实启用（看日志）
+3. 在真实数据集上测试 hidden state anchoring
+4. 对比 hidden state vs token-level 的性能
+5. 性能优化和超参数调优

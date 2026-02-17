@@ -115,6 +115,32 @@
         "lerobot_train_craft.py fully functional"
       ],
       "notes": "所有依赖已完成，可以在真实数据集上进行端到端测试"
+    },
+    {
+      "id": "craft_enabled_smoke",
+      "name": "CRaFT Enabled Smoke Test",
+      "status": "in_progress",
+      "priority": "critical",
+      "description": "Verify CRaFT can be enabled without crashing and anchor loading works correctly",
+      "file": "src/lerobot/scripts/lerobot_train_craft.py",
+      "command": "python -m lerobot.scripts.lerobot_train_craft --dataset.repo_id=lerobot/aloha_sim_insertion_human --policy.path=lerobot/pi0_fast --output_dir=outputs/craft_smoke --steps=3 --batch_size=2 --eval_freq=0 --save_checkpoint=false --num_workers=0 craft.enabled=true craft.anchor_cache_dir=data/anchor_cache",
+      "expected_output": [
+        "✓ AnchorCache 加载成功",
+        "✓ CRaFT 已启用，将在训练中计算保留损失",
+        "L_ret=X.XXX | λ=X.XXX | ε=X.XXX",
+        "dot=X.XXX | cos=X.XXX"
+      ],
+      "failure_indicators": [
+        "⚠ AnchorCache 加载失败",
+        "将以 baseline 模式运行",
+        "craft_config.enabled=False in try/except"
+      ],
+      "dependencies": [
+        "AnchorCache directory exists with valid shards",
+        "preprocessor created before anchor loading",
+        "anchor_batch preprocessed in train loop"
+      ],
+      "notes": "修复了 preprocessor 未创建问题、梯度冲突日志问题、dot product 错位问题"
     }
   ],
   "implementation_phases": [

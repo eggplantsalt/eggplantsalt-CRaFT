@@ -68,7 +68,7 @@ def compute_dot(grad1: list[Tensor], grad2: list[Tensor]) -> Tensor:
     计算两个梯度向量的点积（用于判断梯度方向是否冲突）
     
     【功能说明】
-    将两个梯度列表（每个参数一个张量）展平并计算点积。
+    将两个梯度列表（每个参数一个张量）同位置配对并计算点积。
     点积的符号表示梯度方向的关系：
     - 正值: 梯度方向一致（协同优化）
     - 负值: 梯度方向冲突（需要投影）
@@ -87,10 +87,8 @@ def compute_dot(grad1: list[Tensor], grad2: list[Tensor]) -> Tensor:
         - 正值表示方向一致
         - 负值表示方向冲突
     
-    【实现提示】
-    1. 将每个梯度张量展平为一维向量: grad.flatten()
-    2. 拼接所有参数的梯度: torch.cat([g.flatten() for g in grads])
-    3. 计算点积: torch.dot(flat_grad1, flat_grad2)
+    【实现细节】
+    使用 zip 同位置配对，跳过任一为 None 的项，避免错位问题。
     
     【示例】
     >>> grad_task = [torch.tensor([1.0, 2.0]), torch.tensor([3.0])]
@@ -98,12 +96,13 @@ def compute_dot(grad1: list[Tensor], grad2: list[Tensor]) -> Tensor:
     >>> dot = compute_dot(grad_task, grad_retain)
     >>> print(dot)  # 1*1 + 2*(-1) + 3*0.5 = 0.5
     """
-    # 展平并拼接所有梯度
-    flat_grad1 = torch.cat([g.flatten() for g in grad1 if g is not None])
-    flat_grad2 = torch.cat([g.flatten() for g in grad2 if g is not None])
+    # 使用 zip 同位置配对，累加点积（跳过任一为 None 的项）
+    dot_sum = 0.0
+    for g1, g2 in zip(grad1, grad2):
+        if g1 is not None and g2 is not None:
+            dot_sum += torch.sum(g1 * g2)
     
-    # 计算点积
-    return torch.dot(flat_grad1, flat_grad2)
+    return torch.tensor(dot_sum, device=grad1[0].device if grad1[0] is not None else "cpu")
 
 
 def project_if_conflict(

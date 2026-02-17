@@ -214,12 +214,15 @@ def update_policy_craft(
         # ========================================================================
         # 梯度手术：冲突检测与投影
         # ========================================================================
-        task_grads_filtered = [g for g in task_grads if g is not None]
-        retention_grads_filtered = [g for g in retention_grads if g is not None]
-        
-        if len(task_grads_filtered) > 0 and len(retention_grads_filtered) > 0:
-            # 计算梯度点积
-            grad_dot_product = compute_dot(task_grads_filtered, retention_grads_filtered).item()
+        if len(task_grads) > 0 and len(retention_grads) > 0:
+            # 计算梯度点积（dot product）
+            grad_dot_product = compute_dot(task_grads, retention_grads).item()
+            
+            # 计算梯度余弦相似度（cosine similarity）
+            # cos = dot / (||g_task|| * ||g_retain||)
+            norm_sq_task = compute_dot(task_grads, task_grads).item()
+            norm_sq_ret = compute_dot(retention_grads, retention_grads).item()
+            grad_cos = grad_dot_product / (torch.sqrt(torch.tensor(norm_sq_task)) * torch.sqrt(torch.tensor(norm_sq_ret)) + 1e-12).item()
             
             # 如果启用梯度投影且检测到冲突
             if craft_config.use_grad_projection:
@@ -241,6 +244,8 @@ def update_policy_craft(
             )
         else:
             final_grads = task_grads
+            grad_dot_product = None
+            grad_cos = None
         
         # 设置合并后的梯度到模型参数
         for param, grad in zip(policy.parameters(), final_grads):
@@ -275,6 +280,8 @@ def update_policy_craft(
         output_dict["cache_type"] = "hidden_state" if is_hidden_state_cache else "token_level"
         if grad_dot_product is not None:
             output_dict["grad_dot"] = grad_dot_product
+        if grad_cos is not None:
+            output_dict["grad_cos"] = grad_cos
     else:
         # 没有锚点数据或未启用 CRaFT：使用任务梯度
         for param, grad in zip(policy.parameters(), task_grads):
@@ -390,49 +397,8 @@ def train_craft(
     if craft_config is None:
         craft_config = CraftConfig()
     
-    # 加载 AnchorCache
+    # 注意：此时 preprocessor 尚未创建，稍后再加载 AnchorCache
     anchor_dl_iter = None
-    if craft_config.enabled and craft_config.anchor_cache_dir:
-        if is_main_process:
-            logging.info(colored("=" * 80, "cyan"))
-            logging.info(colored("加载 AnchorCache", "cyan", attrs=["bold"]))
-            logging.info(colored("=" * 80, "cyan"))
-            logging.info(f"AnchorCache 目录: {craft_config.anchor_cache_dir}")
-            logging.info(f"锚点批次大小: {craft_config.anchor_batch_size}")
-            logging.info(f"保留频率 (K-step): 每 {craft_config.retention_freq} 步")
-        
-        try:
-            from lerobot.craft.anchor_cache import AnchorCacheDataset
-            
-            anchor_dataset = AnchorCacheDataset(
-                cache_dir=craft_config.anchor_cache_dir,
-                transform=preprocessor,  # 使用与任务数据相同的预处理
-            )
-            
-            anchor_dataloader = torch.utils.data.DataLoader(
-                anchor_dataset,
-                batch_size=craft_config.anchor_batch_size,
-                shuffle=True,
-                num_workers=cfg.num_workers,
-                pin_memory=device.type == "cuda",
-                drop_last=True,
-            )
-            
-            # 使用 cycle 使其无限循环
-            anchor_dl_iter = cycle(anchor_dataloader)
-            
-            if is_main_process:
-                logging.info(colored(f"✓ AnchorCache 加载成功: {len(anchor_dataset)} 样本", "green"))
-        except Exception as e:
-            if is_main_process:
-                logging.warning(colored(f"⚠ AnchorCache 加载失败: {e}", "yellow"))
-                logging.warning(colored("将以 baseline 模式运行（无保留损失）", "yellow"))
-            craft_config.enabled = False
-    elif craft_config.enabled:
-        if is_main_process:
-            logging.warning(colored("⚠ CRaFT 已启用但未提供 anchor_cache_dir", "yellow"))
-            logging.warning(colored("将以 baseline 模式运行", "yellow"))
-        craft_config.enabled = False
     
     # ============================================================================
     # Environment (for evaluation)
@@ -497,6 +463,54 @@ def train_craft(
         **processor_kwargs,
         **postprocessor_kwargs,
     )
+    
+    # ============================================================================
+    # 加载锚点数据集（CRaFT 特有）- 在 preprocessor 创建后
+    # ============================================================================
+    if craft_config.enabled and craft_config.anchor_cache_dir:
+        if is_main_process:
+            logging.info(colored("=" * 80, "cyan"))
+            logging.info(colored("加载 AnchorCache", "cyan", attrs=["bold"]))
+            logging.info(colored("=" * 80, "cyan"))
+            logging.info(f"AnchorCache 目录: {craft_config.anchor_cache_dir}")
+            logging.info(f"锚点批次大小: {craft_config.anchor_batch_size}")
+            logging.info(f"保留频率 (K-step): 每 {craft_config.retention_freq} 步")
+        
+        try:
+            from lerobot.craft.anchor_cache import AnchorCacheDataset
+            
+            # 不传 transform，让 AnchorCacheDataset 返回 raw batch
+            anchor_dataset = AnchorCacheDataset(
+                cache_dir=craft_config.anchor_cache_dir,
+            )
+            
+            anchor_dataloader = torch.utils.data.DataLoader(
+                anchor_dataset,
+                batch_size=craft_config.anchor_batch_size,
+                shuffle=True,
+                num_workers=cfg.num_workers,
+                pin_memory=device.type == "cuda",
+                drop_last=True,
+            )
+            
+            # 使用 cycle 使其无限循环
+            anchor_dl_iter = cycle(anchor_dataloader)
+            
+            if is_main_process:
+                logging.info(colored(f"✓ AnchorCache 加载成功: {len(anchor_dataset)} 样本", "green"))
+                logging.info(colored("✓ CRaFT 已启用，将在训练中计算保留损失", "green", attrs=["bold"]))
+        except Exception as e:
+            if is_main_process:
+                logging.error(colored(f"✗ AnchorCache 加载失败: {e}", "red"))
+                logging.warning(colored("将以 baseline 模式运行（无保留损失）", "yellow"))
+            craft_config.enabled = False
+            anchor_dl_iter = None
+    elif craft_config.enabled:
+        if is_main_process:
+            logging.warning(colored("⚠ CRaFT 已启用但未提供 anchor_cache_dir", "yellow"))
+            logging.warning(colored("将以 baseline 模式运行", "yellow"))
+        craft_config.enabled = False
+        anchor_dl_iter = None
     
     # ============================================================================
     # Optimizer and Scheduler
@@ -652,9 +666,10 @@ def train_craft(
         anchor_batch = None
         if craft_config.enabled and anchor_dl_iter is not None:
             if step % craft_config.retention_freq == 0:
-                # 加载锚点批次
+                # 加载锚点批次（raw batch）
                 anchor_batch = next(anchor_dl_iter)
-                # 注意：anchor_batch 已经在 AnchorCacheDataset 中预处理过
+                # 应用 preprocessor（与任务数据相同的预处理）
+                anchor_batch = preprocessor(anchor_batch)
         
         # ========================================================================
         # 训练步骤（CRaFT 或 baseline）
@@ -701,7 +716,9 @@ def train_craft(
                     log_msg += " | conflict=✓"
                 
                 if "grad_dot" in output_dict:
-                    log_msg += f" | cos={output_dict['grad_dot']:.3f}"
+                    log_msg += f" | dot={output_dict['grad_dot']:.3f}"
+                if "grad_cos" in output_dict:
+                    log_msg += f" | cos={output_dict['grad_cos']:.3f}"
             
             logging.info(log_msg)
             
@@ -723,6 +740,8 @@ def train_craft(
                     })
                     if "grad_dot" in output_dict:
                         wandb_log_dict["craft/grad_dot"] = output_dict["grad_dot"]
+                    if "grad_cos" in output_dict:
+                        wandb_log_dict["craft/grad_cos"] = output_dict["grad_cos"]
                 
                 wandb_logger.log(wandb_log_dict, step=step)
         
