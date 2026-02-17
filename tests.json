@@ -60,20 +60,23 @@
       "notes": "primal_dual.py 已完整实现（epsilon_schedule, update_lambda）"
     },
     {
-      "id": "retention_loss_computation",
-      "name": "Retention Loss Computation",
-      "status": "not_started",
-      "priority": "medium",
-      "description": "Test retention loss computation on anchor data",
-      "file": "tests/test_retention_loss.py",
+      "id": "hidden_state_anchoring",
+      "name": "Hidden State Anchoring Tests",
+      "status": "passing",
+      "priority": "high",
+      "description": "Unit tests for hidden state retention loss and pooling logic",
+      "file": "tests/test_hidden_state_anchoring.py",
       "test_cases": [
-        "test_compute_retention_loss_basic",
-        "test_retention_loss_matches_policy_forward"
+        "test_compute_retention_loss_hidden_mse",
+        "test_compute_retention_loss_hidden_cosine",
+        "test_compute_retention_loss_hidden_identical",
+        "test_pooling_shape",
+        "test_device_dtype_compatibility"
       ],
       "dependencies": [
-        "retention_loss.py implementation",
-        "anchor_cache.py implementation"
-      ]
+        "retention_loss.py implementation"
+      ],
+      "notes": "所有测试通过，验证 MSE/Cosine loss 数学正确性和 pooling shape"
     },
     {
       "id": "anchor_dataloader",
@@ -175,18 +178,21 @@
     "完整的原对偶优化（epsilon_schedule, update_lambda）",
     "完整的 CRaFT 训练循环（update_policy_craft, train_craft）",
     "AnchorCache 离线生成和加载（build_anchor_cache.py, anchor_cache.py）",
+    "Hidden State Anchoring（表征蒸馏，替代 token-level distillation）",
     "K-step 策略（每 K 步计算一次保留损失）",
     "分布式训练支持（retention_loss 跨进程平均）",
     "完整的日志记录（终端 + WandB）",
     "检查点保存和恢复（包含 CRaFT 状态）",
     "Lambda 历史导出（CSV 格式）",
-    "训练脚本和文档（train_craft.sh, CRAFT_TRAINING_GUIDE.md）"
+    "训练脚本和文档（train_craft.sh, CRAFT_TRAINING_GUIDE.md）",
+    "向后兼容（自动检测 cache 类型：hidden-state 或 token-level）"
   ],
   "next_steps": [
-    "在真实数据集上运行 build_anchor_cache.py",
+    "在真实数据集上生成 hidden state AnchorCache",
     "在小规模数据集上运行完整训练（steps=1000）",
-    "验证 λ 收敛行为和梯度冲突频率",
-    "对比 baseline 和 CRaFT 的性能",
+    "验证 hidden state anchoring 的效果",
+    "对比 hidden state vs token-level 的性能",
+    "更新所有文档以反映 hidden state anchoring",
     "性能优化（如果训练速度过慢）"
   ],
   "notes": [

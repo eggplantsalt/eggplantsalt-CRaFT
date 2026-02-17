@@ -91,17 +91,24 @@ def update_policy_craft(
     lock=None,
 ) -> tuple[MetricsTracker, dict, float]:
     """
-    执行单步 CRaFT 训练（双目标优化）
+    执行单步 CRaFT 训练（双目标优化，支持 Hidden State Anchoring）
     
     【CRaFT 训练流程】
     1. 前向传播（任务数据）→ L_task
     2. 反向传播 L_task → ∇L_task（保存梯度）
-    3. 前向传播（锚点数据）→ L_retain
-    4. 反向传播 L_retain → ∇L_retain（保存梯度）
-    5. 梯度手术：检测冲突并投影
-    6. 合并梯度：g_final = ∇L_task + λ * ∇L_retain
-    7. 优化器更新（使用 g_final）
-    8. 更新 λ：λ ← λ + λ_lr * (L_retain - ε)
+    3. 前向传播（锚点数据）→ 提取 student hidden states
+    4. 计算 L_retain（hidden state loss）
+    5. 反向传播 L_retain → ∇L_retain（保存梯度）
+    6. 梯度手术：检测冲突并投影
+    7. 合并梯度：g_final = ∇L_task + λ * ∇L_retain
+    8. 优化器更新（使用 g_final）
+    9. 更新 λ：λ ← λ + λ_lr * (L_retain - ε)
+    
+    【Hidden State Anchoring】
+    - 不再使用 teacher tokens/labels
+    - 改用 teacher hidden states（从 AnchorCache 加载）
+    - Student 提取相同层的 hidden states 并 pooling
+    - 计算 MSE/Cosine loss
     
     【参数】
     train_metrics: 训练指标跟踪器
@@ -122,6 +129,7 @@ def update_policy_craft(
     """
     from lerobot.craft.grad_surgery import compute_dot, project_if_conflict, merge_grads
     from lerobot.craft.primal_dual import update_lambda
+    from lerobot.craft.retention_loss import compute_retention_loss_hidden, extract_student_hidden_with_pooling
     
     start_time = time.perf_counter()
     policy.train()
@@ -142,22 +150,57 @@ def update_policy_craft(
     ]
     
     # ============================================================================
-    # PHASE 2: 保留损失（CRaFT 特有）
+    # PHASE 2: 保留损失（CRaFT 特有 - Hidden State Anchoring）
     # ============================================================================
     retention_loss_value = None
     grad_conflict_detected = False
     grad_dot_product = None
     
     if anchor_batch is not None and craft_config.enabled:
-        # 清零梯度，准备第二次反向传播
-        optimizer.zero_grad()
+        # 检测 cache 类型
+        is_hidden_state_cache = "teacher_hidden" in anchor_batch
         
-        # 前向传播：计算保留损失
-        with accelerator.autocast():
-            retention_loss, _ = policy.forward(anchor_batch)
-        
-        # 第二次反向传播：计算保留梯度
-        accelerator.backward(retention_loss)
+        if is_hidden_state_cache:
+            # ========================================================================
+            # Hidden State Anchoring（新版本）
+            # ========================================================================
+            # 清零梯度，准备第二次反向传播
+            optimizer.zero_grad()
+            
+            # 提取 student hidden states
+            meta = anchor_batch["meta"]
+            layers_to_extract = meta["layers_to_save"]
+            
+            with accelerator.autocast():
+                student_hidden = extract_student_hidden_with_pooling(
+                    policy,
+                    anchor_batch,
+                    layers_to_extract,
+                    meta,
+                )
+                
+                # 计算 hidden state retention loss
+                teacher_hidden = anchor_batch["teacher_hidden"].to(student_hidden.device)
+                retention_loss = compute_retention_loss_hidden(
+                    student_hidden,
+                    teacher_hidden,
+                    loss_type="mse",  # 可配置
+                    reduction="mean",
+                )
+            
+            # 第二次反向传播：计算保留梯度
+            accelerator.backward(retention_loss)
+            
+        else:
+            # ========================================================================
+            # Token-level Distillation（旧版本，向后兼容）
+            # ========================================================================
+            optimizer.zero_grad()
+            
+            with accelerator.autocast():
+                retention_loss, _ = policy.forward(anchor_batch)
+            
+            accelerator.backward(retention_loss)
         
         # 保存保留梯度
         retention_grads = [
@@ -171,12 +214,11 @@ def update_policy_craft(
         # ========================================================================
         # 梯度手术：冲突检测与投影
         # ========================================================================
-        # 过滤掉 None 梯度（某些参数可能不参与计算）
         task_grads_filtered = [g for g in task_grads if g is not None]
         retention_grads_filtered = [g for g in retention_grads if g is not None]
         
         if len(task_grads_filtered) > 0 and len(retention_grads_filtered) > 0:
-            # 计算梯度点积（用于冲突检测和日志）
+            # 计算梯度点积
             grad_dot_product = compute_dot(task_grads_filtered, retention_grads_filtered).item()
             
             # 如果启用梯度投影且检测到冲突
@@ -187,11 +229,10 @@ def update_policy_craft(
                     craft_config.conflict_threshold,
                 )
             else:
-                # 不使用投影，直接使用原梯度
                 task_grads_proj = task_grads
                 retention_grads_proj = retention_grads
             
-            # 合并梯度：g_final = g_task + λ * g_retain
+            # 合并梯度
             final_grads = merge_grads(
                 task_grads_proj,
                 retention_grads_proj,
@@ -199,7 +240,6 @@ def update_policy_craft(
                 craft_config.projection_mode,
             )
         else:
-            # 如果没有有效梯度，使用任务梯度
             final_grads = task_grads
         
         # 设置合并后的梯度到模型参数
@@ -232,6 +272,7 @@ def update_policy_craft(
         output_dict["lambda"] = current_lambda
         output_dict["epsilon"] = current_epsilon
         output_dict["grad_conflict"] = 1.0 if grad_conflict_detected else 0.0
+        output_dict["cache_type"] = "hidden_state" if is_hidden_state_cache else "token_level"
         if grad_dot_product is not None:
             output_dict["grad_dot"] = grad_dot_product
     else:

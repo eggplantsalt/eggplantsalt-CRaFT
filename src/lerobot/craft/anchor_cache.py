@@ -15,8 +15,8 @@
 # limitations under the License.
 
 """
-锚点数据缓存模块 (Anchor Cache)
-================================
+锚点数据缓存模块 (Anchor Cache - Hidden State Anchoring)
+========================================================
 
 【模块功能】
 管理离线生成的 AnchorCache 的加载和采样，用于 CRaFT 训练中的保留损失计算。
@@ -25,11 +25,16 @@
 由 build_anchor_cache.py 生成的 .pt shard 文件，每个包含：
 {
     "pixel_values": Tensor[B, C, H, W],  # 图像，float32，已归一化到 [-1, 1]
-    "input_ids": Tensor[B, seq_len],     # 完整输入序列（prompt + teacher suffix）
+    "input_ids": Tensor[B, seq_len],     # 完整输入序列（prompt + BOS）
     "attention_mask": Tensor[B, seq_len], # 注意力掩码
-    "labels": Tensor[B, seq_len],        # 标签（prompt 部分为 -100，suffix 为 token ids）
-    "prompts": List[str],                # Prompt 字符串（用于调试）
+    "teacher_hidden": Tensor[B, n_layers, n_vecs, hidden_dim],  # Teacher hidden states
+    "meta": dict,  # 元数据：layers, pooling 策略等
+    "prompts": List[str],  # Prompt 字符串（用于调试）
 }
+
+【与 Token-level 版本的区别】
+- 旧版本：包含 labels（teacher 生成的 tokens）
+- 新版本：包含 teacher_hidden（teacher 的 hidden states）
 
 【使用示例】
 ```python
@@ -37,7 +42,7 @@ from lerobot.craft.anchor_cache import AnchorCacheDataset, build_anchor_dataload
 
 # 创建 DataLoader
 anchor_dataloader = build_anchor_dataloader(
-    cache_dir="data/anchor_cache",
+    cache_dir="data/anchor_cache_hidden",
     batch_size=16,
     num_workers=4,
     shuffle=True
@@ -49,15 +54,15 @@ anchor_dl_iter = cycle(anchor_dataloader)
 
 for step in range(total_steps):
     anchor_batch = next(anchor_dl_iter)
-    # anchor_batch 包含: pixel_values, input_ids, attention_mask, labels
-    retention_loss = compute_retention_loss(policy, anchor_batch)
+    # anchor_batch 包含: pixel_values, input_ids, attention_mask, teacher_hidden, meta
+    retention_loss = compute_retention_loss_hidden(student_hidden, anchor_batch["teacher_hidden"])
 ```
 
 【设计考虑】
-1. 离线生成: Teacher 生成在训练前完成，避免在线调用开销
-2. 确定性: Teacher 使用 temperature=0 生成，保证可复现
-3. Token-level CE: labels 正确标记了 prompt 和 suffix 部分
-4. 内存效率: 支持分 shard 加载，不需要全部加载到内存
+1. 离线生成: Teacher hidden states 在训练前完成，避免在线调用开销
+2. 表征蒸馏: 使用 hidden states 而非 tokens，更稳定
+3. 内存效率: 只保存少量 pooled vectors，cache 很小
+4. 向后兼容: 自动检测 cache 类型（token-level 或 hidden-state）
 """
 
 import json
@@ -80,6 +85,11 @@ class AnchorCacheDataset(Dataset):
     - pixel_values: Tensor[C, H, W], 图像，float32，[-1, 1]
     - input_ids: Tensor[seq_len], 完整输入序列
     - attention_mask: Tensor[seq_len], 注意力掩码
+    - teacher_hidden: Tensor[n_layers, n_vecs, hidden_dim], Teacher hidden states
+    - meta: dict, 元数据（layers, pooling 策略等）
+    
+    【向后兼容】
+    如果 cache 是旧版本（token-level），则包含：
     - labels: Tensor[seq_len], 标签（prompt=-100, suffix=token_ids）
     
     【参数】
@@ -179,7 +189,8 @@ class AnchorCacheDataset(Dataset):
         idx: int, 样本索引
         
         【返回值】
-        dict: 包含 pixel_values, input_ids, attention_mask, labels 的样本字典
+        dict: 包含 pixel_values, input_ids, attention_mask, teacher_hidden, meta 的样本字典
+              （如果是旧版本 cache，则包含 labels 而非 teacher_hidden）
         """
         if idx < 0 or idx >= self.num_anchors:
             raise IndexError(f"索引 {idx} 超出范围 [0, {self.num_anchors})")
@@ -191,13 +202,23 @@ class AnchorCacheDataset(Dataset):
         # 加载 shard
         shard_data = self._load_shard(shard_idx)
         
-        # 提取样本
+        # 提取样本（基础字段）
         sample = {
             "pixel_values": shard_data["pixel_values"][local_idx],
             "input_ids": shard_data["input_ids"][local_idx],
             "attention_mask": shard_data["attention_mask"][local_idx],
-            "labels": shard_data["labels"][local_idx],
         }
+        
+        # 检测 cache 类型并添加相应字段
+        if "teacher_hidden" in shard_data:
+            # Hidden state anchoring（新版本）
+            sample["teacher_hidden"] = shard_data["teacher_hidden"][local_idx]
+            sample["meta"] = shard_data["meta"]
+        elif "labels" in shard_data:
+            # Token-level distillation（旧版本，向后兼容）
+            sample["labels"] = shard_data["labels"][local_idx]
+        else:
+            raise ValueError("AnchorCache 格式错误：既没有 teacher_hidden 也没有 labels")
         
         return sample
 

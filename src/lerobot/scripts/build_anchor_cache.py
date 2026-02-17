@@ -15,23 +15,39 @@
 # limitations under the License.
 
 """
-离线 AnchorCache 生成脚本
-========================
+离线 AnchorCache 生成脚本（Hidden State Anchoring）
+===================================================
 
 【功能说明】
 为 CRaFT 训练生成离线 AnchorCache，包含：
 - 图像帧（从 LeRobot dataset 采样）
 - 固定的 prompt 模板
-- Teacher 模型生成的 suffix tokens（确定性生成）
+- Teacher 模型的 hidden states（表征蒸馏）
+
+【与 Token-level 版本的区别】
+- 旧版本：保存 teacher 生成的 suffix tokens/labels（用于 token-level distillation）
+- 新版本：保存 teacher 的 hidden states（用于 representation distillation）
+
+【优势】
+1. 避免 π0_fast 不稳定输出自然语言的问题
+2. Cache 更小（只保存少量 hidden vectors）
+3. 训练更稳定（hidden states 比 tokens 更平滑）
 
 【输出格式】
 生成多个 .pt shard 文件，每个包含：
 {
-    "pixel_values": Tensor[B, C, H, W],  # 图像，float32，已归一化到 [-1, 1]
-    "input_ids": Tensor[B, seq_len],     # 完整输入序列（prompt + BOS）
-    "attention_mask": Tensor[B, seq_len], # 注意力掩码
-    "labels": Tensor[B, seq_len],        # 标签（prompt 部分为 -100，suffix 为 token ids，EOS 后为 -100）
+    "pixel_values": Tensor[B, C, H, W],      # 图像，float32，已归一化到 [-1, 1]
+    "input_ids": Tensor[B, seq_len],         # 完整输入序列（prompt + BOS）
+    "attention_mask": Tensor[B, seq_len],    # 注意力掩码
+    "teacher_hidden": Tensor[B, n_layers, n_vecs, hidden_dim],  # Teacher hidden states
+    "meta": dict,  # 元数据：layers_to_save, pooling 方式, token 范围等
 }
+
+【Hidden States 提取策略】
+- layers_to_save: 默认 [-2, -1]（最后两层）
+- token_pooling:
+    a) vision_token_mean: 对视觉 token 取 mean pooling，得到 1 个向量
+    b) text_token_last: 对文本 token 取最后一个 token 向量
 
 【使用示例】
 ```bash
@@ -39,39 +55,19 @@
 python src/lerobot/scripts/build_anchor_cache.py \\
     --policy.pretrained_path=physical-intelligence/pi0-fast \\
     --dataset.repo_id=lerobot/aloha_sim_insertion_human \\
-    --out_dir=data/anchor_cache \\
-    --num_anchors=1000
+    --out_dir=data/anchor_cache_hidden \\
+    --num_anchors=1000 \\
+    --layers_to_save=-2,-1
 
 # 自定义 prompts
 python src/lerobot/scripts/build_anchor_cache.py \\
     --policy.pretrained_path=physical-intelligence/pi0-fast \\
     --dataset.repo_id=lerobot/aloha_sim_insertion_human \\
-    --out_dir=data/anchor_cache \\
+    --out_dir=data/anchor_cache_hidden \\
     --num_anchors=1000 \\
     --prompts_file=prompts.json \\
-    --max_new_tokens=256 \\
     --shard_size=100
 ```
-
-【Prompts 文件格式】
-JSON 格式，包含 prompt 模板列表：
-```json
-{
-    "prompts": [
-        "Pick up the object",
-        "Place the object in the box",
-        "Move to the target position"
-    ]
-}
-```
-
-【注意事项】
-1. Teacher 生成必须确定性：do_sample=False, temperature=0
-2. 图像自动探测 dataset 中的 camera keys（支持多种命名）
-3. 输出 labels 的 mask 规则：
-   - Prompt tokens: -100（不计算损失）
-   - Teacher suffix tokens: 实际 token ids（计算损失）
-   - EOS 之后: -100（不计算损失）
 """
 
 import argparse
@@ -93,7 +89,7 @@ from lerobot.utils.logging_utils import init_logging
 from lerobot.utils.random_utils import set_seed
 
 
-# 默认 prompt 模板（如果用户未提供）
+# 默认 prompt 模板
 DEFAULT_PROMPTS = [
     "Pick up the object",
     "Place the object in the container",
@@ -104,15 +100,7 @@ DEFAULT_PROMPTS = [
 
 
 def load_prompts(prompts_file: Path | None) -> list[str]:
-    """
-    加载 prompt 模板列表
-    
-    Args:
-        prompts_file: JSON 文件路径，包含 {"prompts": [...]} 格式
-    
-    Returns:
-        Prompt 字符串列表
-    """
+    """加载 prompt 模板列表"""
     if prompts_file is None or not prompts_file.exists():
         logging.info(f"使用默认 prompts: {DEFAULT_PROMPTS}")
         return DEFAULT_PROMPTS
@@ -130,23 +118,10 @@ def load_prompts(prompts_file: Path | None) -> list[str]:
 
 
 def detect_image_keys(dataset) -> list[str]:
-    """
-    自动探测 dataset 中的图像 keys
-    
-    LeRobot dataset 的图像 key 可能有多种命名方式：
-    - observation.images.{camera_name}
-    - observation.image
-    - pixels.{camera_name}
-    
-    Args:
-        dataset: LeRobot dataset 实例
-    
-    Returns:
-        图像 key 列表
-    """
+    """自动探测 dataset 中的图像 keys"""
     image_keys = []
     
-    # 方法 1: 使用 dataset.meta.camera_keys（最可靠）
+    # 方法 1: 使用 dataset.meta.camera_keys
     if hasattr(dataset, 'meta') and hasattr(dataset.meta, 'camera_keys'):
         image_keys = dataset.meta.camera_keys
         logging.info(f"从 dataset.meta.camera_keys 探测到图像 keys: {image_keys}")
@@ -161,7 +136,7 @@ def detect_image_keys(dataset) -> list[str]:
             logging.info(f"从 features 探测到图像 keys: {image_keys}")
             return image_keys
     
-    # 方法 3: 从第一个样本中探测（fallback）
+    # 方法 3: 从第一个样本中探测
     if len(dataset) > 0:
         sample = dataset[0]
         for key, value in sample.items():
@@ -175,17 +150,7 @@ def detect_image_keys(dataset) -> list[str]:
 
 
 def sample_frames_from_dataset(dataset, num_samples: int, seed: int = 42) -> list[dict]:
-    """
-    从 dataset 中随机采样帧
-    
-    Args:
-        dataset: LeRobot dataset
-        num_samples: 采样数量
-        seed: 随机种子
-    
-    Returns:
-        采样的帧列表
-    """
+    """从 dataset 中随机采样帧"""
     rng = random.Random(seed)
     total_frames = len(dataset)
     
@@ -193,9 +158,8 @@ def sample_frames_from_dataset(dataset, num_samples: int, seed: int = 42) -> lis
         logging.warning(f"请求采样 {num_samples} 帧，但 dataset 只有 {total_frames} 帧，将采样全部")
         num_samples = total_frames
     
-    # 随机采样索引
     indices = rng.sample(range(total_frames), num_samples)
-    indices.sort()  # 排序以提高访问效率
+    indices.sort()
     
     logging.info(f"从 {total_frames} 帧中采样 {num_samples} 帧")
     
@@ -214,44 +178,28 @@ def prepare_teacher_inputs(
     policy,
     device: torch.device,
 ) -> dict:
-    """
-    准备 teacher 模型的输入
-    
-    Args:
-        frames: 采样的帧列表
-        prompts: Prompt 模板列表
-        image_keys: 图像 key 列表
-        policy: Policy 实例（用于访问 processor）
-        device: 设备
-    
-    Returns:
-        包含 pixel_values, input_ids, attention_mask 的字典
-    """
+    """准备 teacher 模型的输入"""
     batch_size = len(frames)
     
     # 为每个帧随机分配一个 prompt
     rng = random.Random(42)
     frame_prompts = [rng.choice(prompts) for _ in range(batch_size)]
     
-    # 提取图像（使用第一个 image key）
-    # 注意：pi0_fast 支持多相机，但这里简化为使用第一个相机
+    # 提取图像
     primary_image_key = image_keys[0]
     logging.info(f"使用图像 key: {primary_image_key}")
     
     images = []
     for frame in frames:
         img = frame[primary_image_key]
-        # 确保图像格式正确 [C, H, W]
-        if img.ndim == 4:  # [1, C, H, W]
+        if img.ndim == 4:
             img = img.squeeze(0)
         images.append(img)
     
-    images = torch.stack(images).to(device)  # [B, C, H, W]
-    
-    # 使用 policy 的 tokenizer 处理 prompts
-    tokenizer = policy._paligemma_tokenizer
+    images = torch.stack(images).to(device)
     
     # Tokenize prompts
+    tokenizer = policy._paligemma_tokenizer
     tokenized = tokenizer(
         frame_prompts,
         return_tensors="pt",
@@ -263,20 +211,17 @@ def prepare_teacher_inputs(
     input_ids = tokenized["input_ids"].to(device)
     attention_mask = tokenized["attention_mask"].to(device)
     
-    # 预处理图像（归一化到 [-1, 1]）
-    # pi0_fast 期望图像在 [-1, 1] 范围
+    # 预处理图像
     if images.dtype == torch.uint8:
-        images = images.float() / 255.0  # [0, 1]
-    images = images * 2.0 - 1.0  # [-1, 1]
+        images = images.float() / 255.0
+    images = images * 2.0 - 1.0
     
-    # Resize 图像到 policy 期望的分辨率
+    # Resize 图像
     from lerobot.policies.pi0_fast.modeling_pi0_fast import resize_with_pad_torch
     
     target_h, target_w = policy.config.image_resolution
-    # 转换为 [B, H, W, C] 格式（resize_with_pad_torch 期望）
     images_hwc = images.permute(0, 2, 3, 1)
     images_resized = resize_with_pad_torch(images_hwc, target_h, target_w)
-    # 转回 [B, C, H, W]
     pixel_values = images_resized.permute(0, 3, 1, 2)
     
     return {
@@ -287,106 +232,139 @@ def prepare_teacher_inputs(
     }
 
 
-def generate_teacher_outputs(
+def extract_hidden_states_with_pooling(
     teacher_inputs: dict,
     policy,
-    max_new_tokens: int,
+    layers_to_save: list[int],
     device: torch.device,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, dict]:
     """
-    使用 teacher 模型生成 suffix tokens（确定性生成）
+    提取 teacher 模型的 hidden states 并进行 pooling
     
     Args:
         teacher_inputs: 包含 pixel_values, input_ids, attention_mask 的字典
         policy: Teacher policy 实例
-        max_new_tokens: 最大生成 token 数
+        layers_to_save: 要保存的层索引（负数表示从后往前数）
         device: 设备
     
     Returns:
-        生成的 token ids [B, max_new_tokens]
+        teacher_hidden: [B, n_layers, n_vecs, hidden_dim]
+        meta: 元数据字典
     """
     policy.eval()
     
     with torch.no_grad():
-        # 准备输入（模拟 pi0_fast 的输入格式）
-        images = [teacher_inputs["pixel_values"]]  # List of images
+        # 准备输入
+        images = [teacher_inputs["pixel_values"]]
         img_masks = [torch.ones(len(images[0]), dtype=torch.bool, device=device)]
         tokens = teacher_inputs["input_ids"]
         masks = teacher_inputs["attention_mask"]
         
-        # 使用 policy 的 sample_actions_fast 方法生成 tokens
-        # 注意：这里我们需要生成 action tokens，但实际上我们想要的是 language tokens
-        # 对于 pi0_fast，我们直接调用底层的生成方法
+        # 添加 BOS token
+        bsize = tokens.shape[0]
+        bos_token = torch.full(
+            (bsize, 1), policy._paligemma_tokenizer.bos_token_id, dtype=torch.long, device=device
+        )
+        tokens = torch.cat([tokens, bos_token], dim=1)
+        masks = torch.cat([masks, torch.ones((bsize, 1), dtype=torch.bool, device=device)], dim=1)
         
-        # 使用确定性生成：temperature=0
-        if policy.config.use_kv_cache:
-            generated_tokens = policy.model.sample_actions_fast_kv_cache(
-                images=images,
-                img_masks=img_masks,
-                tokens=tokens,
-                masks=masks,
-                max_decoding_steps=max_new_tokens,
-                temperature=0.0,  # 确定性生成
+        # Embed prefix（不生成 action tokens）
+        prefix_embs, prefix_pad_masks, prefix_att_masks, total_t_images, _ = (
+            policy.model.embed_prefix_fast(
+                images, img_masks, tokens, masks,
+                fast_action_tokens=None,
+                fast_action_masks=None,
             )
-        else:
-            generated_tokens = policy.model.sample_actions_fast(
-                images=images,
-                img_masks=img_masks,
-                tokens=tokens,
-                masks=masks,
-                max_decoding_steps=max_new_tokens,
-                temperature=0.0,  # 确定性生成
-            )
-    
-    return generated_tokens
-
-
-def create_labels_with_mask(
-    input_ids: torch.Tensor,
-    generated_tokens: torch.Tensor,
-    tokenizer,
-) -> torch.Tensor:
-    """
-    创建 labels 张量，正确设置 mask
-    
-    规则：
-    - Prompt tokens: -100（不计算损失）
-    - Teacher suffix tokens: 实际 token ids（计算损失）
-    - EOS 之后: -100（不计算损失）
-    - Padding: -100（不计算损失）
-    
-    Args:
-        input_ids: 输入 token ids [B, prompt_len]
-        generated_tokens: 生成的 token ids [B, gen_len]
-        tokenizer: Tokenizer 实例
-    
-    Returns:
-        Labels 张量 [B, total_len]
-    """
-    batch_size = input_ids.shape[0]
-    prompt_len = input_ids.shape[1]
-    gen_len = generated_tokens.shape[1]
-    total_len = prompt_len + gen_len
-    
-    # 初始化 labels 为 -100
-    labels = torch.full((batch_size, total_len), -100, dtype=torch.long)
-    
-    # Prompt 部分保持 -100（不计算损失）
-    # Suffix 部分设置为实际 token ids
-    labels[:, prompt_len:] = generated_tokens
-    
-    # 找到 EOS token 并将其后的 tokens 设置为 -100
-    eos_token_id = tokenizer.eos_token_id
-    if eos_token_id is not None:
-        for i in range(batch_size):
-            # 在 generated_tokens 中找到第一个 EOS
-            eos_positions = (generated_tokens[i] == eos_token_id).nonzero(as_tuple=True)[0]
-            if len(eos_positions) > 0:
-                first_eos = eos_positions[0].item()
-                # EOS 之后的所有 tokens 设置为 -100
-                labels[i, prompt_len + first_eos + 1:] = -100
-    
-    return labels
+        )
+        
+        if policy.model.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype == torch.bfloat16:
+            prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
+        
+        # Forward pass 并提取 hidden states
+        position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        att_4d = policy.model._prepare_attention_masks_4d(prefix_att_masks, dtype=prefix_embs.dtype)
+        
+        # 使用 output_hidden_states=True
+        language_model = policy.model.paligemma_with_expert.paligemma.language_model
+        outputs = language_model.forward(
+            inputs_embeds=prefix_embs,
+            attention_mask=att_4d,
+            position_ids=position_ids,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        
+        # outputs.hidden_states 是一个 tuple，包含每一层的 hidden states
+        # hidden_states[0] 是 embedding layer 的输出
+        # hidden_states[1] 到 hidden_states[n] 是各层的输出
+        all_hidden_states = outputs.hidden_states  # tuple of [B, seq_len, hidden_dim]
+        
+        # 选择要保存的层
+        total_layers = len(all_hidden_states) - 1  # 减去 embedding layer
+        selected_hidden_states = []
+        actual_layer_indices = []
+        
+        for layer_idx in layers_to_save:
+            # 负数索引转换为正数
+            if layer_idx < 0:
+                actual_idx = total_layers + layer_idx + 1  # +1 因为 hidden_states[0] 是 embedding
+            else:
+                actual_idx = layer_idx + 1
+            
+            if 0 <= actual_idx < len(all_hidden_states):
+                selected_hidden_states.append(all_hidden_states[actual_idx])
+                actual_layer_indices.append(actual_idx - 1)  # 记录实际层号（不包括 embedding）
+            else:
+                logging.warning(f"层索引 {layer_idx} 超出范围，跳过")
+        
+        if not selected_hidden_states:
+            raise ValueError(f"没有有效的层索引: {layers_to_save}")
+        
+        # Pooling 策略
+        # 1. Vision tokens: mean pooling
+        # 2. Text tokens: last token
+        
+        num_vision_tokens = total_t_images
+        num_text_tokens = tokens.shape[1]
+        
+        pooled_hidden_states = []
+        
+        for hidden_state in selected_hidden_states:
+            # hidden_state: [B, seq_len, hidden_dim]
+            # seq_len = num_vision_tokens + num_text_tokens
+            
+            # Vision tokens: [B, num_vision_tokens, hidden_dim]
+            vision_hidden = hidden_state[:, :num_vision_tokens, :]
+            vision_pooled = vision_hidden.mean(dim=1)  # [B, hidden_dim]
+            
+            # Text tokens: [B, num_text_tokens, hidden_dim]
+            text_hidden = hidden_state[:, num_vision_tokens:, :]
+            # 找到每个样本的最后一个有效 text token
+            text_masks = masks  # [B, num_text_tokens]
+            last_text_indices = text_masks.sum(dim=1) - 1  # [B]
+            text_pooled = text_hidden[torch.arange(bsize), last_text_indices]  # [B, hidden_dim]
+            
+            # 拼接: [B, 2, hidden_dim]
+            layer_pooled = torch.stack([vision_pooled, text_pooled], dim=1)
+            pooled_hidden_states.append(layer_pooled)
+        
+        # 拼接所有层: [B, n_layers, 2, hidden_dim]
+        teacher_hidden = torch.stack(pooled_hidden_states, dim=1)
+        
+        # 元数据
+        meta = {
+            "layers_to_save": actual_layer_indices,
+            "num_vision_tokens": num_vision_tokens,
+            "num_text_tokens": num_text_tokens,
+            "pooling_strategy": {
+                "vision": "mean",
+                "text": "last",
+            },
+            "hidden_dim": teacher_hidden.shape[-1],
+            "n_vecs": 2,  # vision_pooled + text_pooled
+        }
+        
+        return teacher_hidden.cpu().float(), meta
 
 
 def save_anchor_cache_shard(
@@ -394,19 +372,15 @@ def save_anchor_cache_shard(
     out_dir: Path,
     shard_idx: int,
 ) -> None:
-    """
-    保存一个 anchor cache shard
-    
-    Args:
-        shard_data: 包含 pixel_values, input_ids, attention_mask, labels 的字典
-        out_dir: 输出目录
-        shard_idx: Shard 索引
-    """
+    """保存一个 anchor cache shard"""
     out_dir.mkdir(parents=True, exist_ok=True)
     shard_path = out_dir / f"shard_{shard_idx:04d}.pt"
     
-    # 转换为 CPU 并保存
-    shard_data_cpu = {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in shard_data.items()}
+    # 转换为 CPU
+    shard_data_cpu = {
+        k: v.cpu() if isinstance(v, torch.Tensor) else v 
+        for k, v in shard_data.items()
+    }
     
     torch.save(shard_data_cpu, shard_path)
     logging.info(f"保存 shard {shard_idx} 到 {shard_path}")
@@ -418,35 +392,26 @@ def build_anchor_cache(
     out_dir: Path,
     num_anchors: int,
     prompts_file: Path | None = None,
-    max_new_tokens: int = 256,
+    layers_to_save: list[int] = None,
     shard_size: int = 100,
     seed: int = 42,
     device: str = "cuda",
 ) -> None:
-    """
-    构建 AnchorCache
+    """构建 AnchorCache（Hidden State Anchoring）"""
+    if layers_to_save is None:
+        layers_to_save = [-2, -1]  # 默认最后两层
     
-    Args:
-        policy_pretrained_path: Teacher 模型路径
-        dataset_repo_id: LeRobot dataset repo id
-        out_dir: 输出目录
-        num_anchors: 总 anchor 数量
-        prompts_file: Prompts 文件路径（可选）
-        max_new_tokens: Teacher 生成的最大 token 数
-        shard_size: 每个 shard 的样本数
-        seed: 随机种子
-        device: 设备
-    """
     set_seed(seed)
     device = torch.device(device if torch.cuda.is_available() else "cpu")
     
     logging.info("=" * 80)
-    logging.info("开始构建 AnchorCache")
+    logging.info("开始构建 AnchorCache（Hidden State Anchoring）")
     logging.info("=" * 80)
     logging.info(f"Teacher 模型: {policy_pretrained_path}")
     logging.info(f"Dataset: {dataset_repo_id}")
     logging.info(f"输出目录: {out_dir}")
     logging.info(f"Anchor 数量: {num_anchors}")
+    logging.info(f"保存层: {layers_to_save}")
     logging.info(f"Shard 大小: {shard_size}")
     logging.info(f"设备: {device}")
     
@@ -456,13 +421,11 @@ def build_anchor_cache(
     # 2. 加载 dataset
     logging.info(f"加载 dataset: {dataset_repo_id}")
     from lerobot.configs.train import DatasetConfig
-    dataset_cfg = DatasetConfig(repo_id=dataset_repo_id)
-    
-    # 创建一个临时的 TrainPipelineConfig 用于 make_dataset
     from lerobot.configs.policies import PreTrainedConfig
+    
+    dataset_cfg = DatasetConfig(repo_id=dataset_repo_id)
     policy_cfg = PreTrainedConfig.from_pretrained(policy_pretrained_path)
     
-    # 创建临时配置
     class TempConfig:
         def __init__(self):
             self.dataset = dataset_cfg
@@ -508,51 +471,39 @@ def build_anchor_cache(
             device,
         )
         
-        # 生成 teacher outputs
-        generated_tokens = generate_teacher_outputs(
+        # 提取 hidden states
+        teacher_hidden, meta = extract_hidden_states_with_pooling(
             teacher_inputs,
             policy,
-            max_new_tokens,
+            layers_to_save,
             device,
         )
-        
-        # 创建 labels
-        labels = create_labels_with_mask(
-            teacher_inputs["input_ids"],
-            generated_tokens,
-            policy._paligemma_tokenizer,
-        )
-        
-        # 拼接 input_ids 和 generated_tokens
-        full_input_ids = torch.cat([teacher_inputs["input_ids"], generated_tokens], dim=1)
-        
-        # 扩展 attention_mask
-        gen_mask = torch.ones_like(generated_tokens, dtype=torch.long)
-        full_attention_mask = torch.cat([teacher_inputs["attention_mask"], gen_mask], dim=1)
         
         # 构建 shard 数据
         shard_data = {
             "pixel_values": teacher_inputs["pixel_values"],
-            "input_ids": full_input_ids,
-            "attention_mask": full_attention_mask,
-            "labels": labels,
-            "prompts": teacher_inputs["prompts"],  # 保存 prompts 用于调试
+            "input_ids": teacher_inputs["input_ids"],
+            "attention_mask": teacher_inputs["attention_mask"],
+            "teacher_hidden": teacher_hidden,  # [B, n_layers, n_vecs, hidden_dim]
+            "meta": meta,
+            "prompts": teacher_inputs["prompts"],
         }
         
         # 保存 shard
         save_anchor_cache_shard(shard_data, out_dir, shard_idx)
     
-    # 7. 保存元数据
+    # 7. 保存全局元数据
     metadata = {
         "num_anchors": num_anchors,
         "num_shards": num_shards,
         "shard_size": shard_size,
-        "max_new_tokens": max_new_tokens,
+        "layers_to_save": layers_to_save,
         "prompts": prompts,
         "image_keys": image_keys,
         "policy_pretrained_path": policy_pretrained_path,
         "dataset_repo_id": dataset_repo_id,
         "seed": seed,
+        "cache_type": "hidden_state_anchoring",  # 标记为 hidden state 版本
     }
     
     metadata_path = out_dir / "metadata.json"
@@ -567,20 +518,16 @@ def build_anchor_cache(
 
 @parser.wrap()
 def main(cfg: TrainPipelineConfig):
-    """
-    主函数：解析命令行参数并构建 AnchorCache
-    """
-    # 从配置中提取参数
+    """主函数"""
     policy_pretrained_path = cfg.policy.pretrained_path
     dataset_repo_id = cfg.dataset.repo_id
     
-    # 解析额外的命令行参数
     import sys
     parser_extra = argparse.ArgumentParser()
     parser_extra.add_argument("--out_dir", type=str, required=True, help="输出目录")
     parser_extra.add_argument("--num_anchors", type=int, required=True, help="Anchor 数量")
     parser_extra.add_argument("--prompts_file", type=str, default=None, help="Prompts JSON 文件路径")
-    parser_extra.add_argument("--max_new_tokens", type=int, default=256, help="Teacher 生成的最大 token 数")
+    parser_extra.add_argument("--layers_to_save", type=str, default="-2,-1", help="要保存的层索引（逗号分隔）")
     parser_extra.add_argument("--shard_size", type=int, default=100, help="每个 shard 的样本数")
     parser_extra.add_argument("--seed", type=int, default=42, help="随机种子")
     parser_extra.add_argument("--device", type=str, default="cuda", help="设备 (cuda/cpu)")
@@ -589,6 +536,7 @@ def main(cfg: TrainPipelineConfig):
     
     out_dir = Path(args.out_dir)
     prompts_file = Path(args.prompts_file) if args.prompts_file else None
+    layers_to_save = [int(x.strip()) for x in args.layers_to_save.split(',')]
     
     build_anchor_cache(
         policy_pretrained_path=policy_pretrained_path,
@@ -596,7 +544,7 @@ def main(cfg: TrainPipelineConfig):
         out_dir=out_dir,
         num_anchors=args.num_anchors,
         prompts_file=prompts_file,
-        max_new_tokens=args.max_new_tokens,
+        layers_to_save=layers_to_save,
         shard_size=args.shard_size,
         seed=args.seed,
         device=args.device,
@@ -607,4 +555,3 @@ if __name__ == "__main__":
     init_logging()
     register_third_party_plugins()
     main()
-
