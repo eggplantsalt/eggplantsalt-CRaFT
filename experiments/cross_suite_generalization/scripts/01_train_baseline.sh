@@ -62,6 +62,7 @@ python -m lerobot.scripts.lerobot_train \
     --env.task="${ENV_TASK}" \
     --dataset.repo_id="${DATASET_REPO_ID}" \
     --dataset.use_imagenet_stats=false \
+    --dataset.video_backend=pyav \
     --rename_map '{"observation.images.agentview_rgb": "observation.images.image", "observation.images.eye_in_hand_rgb": "observation.images.image2"}' \
     --output_dir="${OUTPUT_DIR}" \
     --steps="${STEPS}" \
