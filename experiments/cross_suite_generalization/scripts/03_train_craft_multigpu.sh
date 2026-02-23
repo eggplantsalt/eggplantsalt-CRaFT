@@ -119,8 +119,7 @@ accelerate launch \
     --multi_gpu \
     -m lerobot.scripts.lerobot_train_craft \
     --policy.path="${POLICY_PATH}" \
-    --policy.repo_id="local/pi0fast_spatial_craft" \
-    --training.push_to_hub=false \
+    --policy.repo_id="local/pi0fast_craft" \
     --env.type="${ENV_TYPE}" \
     --env.task="${ENV_TASK}" \
     --dataset.repo_id="${DATASET_REPO_ID}" \

@@ -3,6 +3,7 @@
 
 policy:
   path: lerobot/pi0fast-base  # 官方预训练模型
+  repo_id: local/pi0fast_craft  # 本地占位符
   device: cuda
   use_amp: false
 
