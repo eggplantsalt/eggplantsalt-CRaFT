@@ -93,6 +93,8 @@ accelerate launch \
     --multi_gpu \
     -m lerobot.scripts.lerobot_train \
     --policy.path="${POLICY_PATH}" \
+    --policy.repo_id="local/pi0fast_spatial_baseline" \
+    --training.push_to_hub=false \
     --env.type="${ENV_TYPE}" \
     --env.task="${ENV_TASK}" \
     --dataset.repo_id="${DATASET_REPO_ID}" \

@@ -18,6 +18,15 @@
 - 使用全量数据集 `lerobot/libero`
 - 通过 `--env.task=libero_spatial` 参数让 LeRobot 自动过滤出对应 Suite 的数据
 
+### 错误 3: 缺少 policy.repo_id 参数
+**错误信息**: `ValueError: 'policy.repo_id' argument missing. Please specify it to push the model to the hub`
+
+**原因**: LeRobot 在验证参数时默认需要一个 repo_id 用于模型推送
+
+**解决方案**: 
+- 添加 `--policy.repo_id=local/pi0fast_spatial_baseline` (本地占位符)
+- 添加 `--training.push_to_hub=false` (禁止推送到 HuggingFace)
+
 ## 修复内容
 
 ### 1. 训练脚本修复
@@ -32,6 +41,10 @@ DATASET_REPO_ID="lerobot/libero_spatial_no_noops"
 POLICY_PATH="lerobot/pi0fast-base"  # 官方预训练模型
 ENV_TASK="libero_spatial"  # 通过 env.task 过滤数据集
 DATASET_REPO_ID="lerobot/libero"  # 使用全量数据集
+
+# 训练命令中添加
+--policy.repo_id="local/pi0fast_spatial_baseline"  # 本地占位符
+--training.push_to_hub=false  # 禁止推送到 HuggingFace
 ```
 
 #### ✅ `02_build_anchor_cache.sh`
@@ -55,6 +68,10 @@ DATASET_REPO_ID="lerobot/libero_spatial_no_noops"
 POLICY_PATH="lerobot/pi0fast-base"  # 官方预训练模型
 ENV_TASK="libero_spatial"  # 通过 env.task 过滤数据集
 DATASET_REPO_ID="lerobot/libero"  # 使用全量数据集
+
+# 训练命令中添加
+--policy.repo_id="local/pi0fast_spatial_craft"  # 本地占位符
+--training.push_to_hub=false  # 禁止推送到 HuggingFace
 ```
 
 ### 2. 多 GPU 脚本修复
@@ -121,6 +138,8 @@ LeRobot 的原生逻辑：
 ```bash
 python -m lerobot.scripts.lerobot_train \
     --policy.path=lerobot/pi0fast-base \
+    --policy.repo_id=local/pi0fast_spatial_baseline \
+    --training.push_to_hub=false \
     --env.type=libero \
     --env.task=libero_spatial \
     --dataset.repo_id=lerobot/libero \
@@ -130,6 +149,8 @@ python -m lerobot.scripts.lerobot_train \
 
 关键参数：
 - `--policy.path=lerobot/pi0fast-base`: 从 HuggingFace Hub 加载预训练模型
+- `--policy.repo_id=local/pi0fast_spatial_baseline`: 本地占位符（不会实际推送）
+- `--training.push_to_hub=false`: 显式禁止推送到 HuggingFace
 - `--env.type=libero`: 指定环境类型
 - `--env.task=libero_spatial`: 指定具体任务（自动过滤数据）
 - `--dataset.repo_id=lerobot/libero`: 使用全量数据集
