@@ -87,9 +87,9 @@ fi
 echo "开始训练 Baseline (使用 ${NUM_GPUS} 个 GPU)..."
 echo ""
 
-# 设置 Headless 渲染环境变量（无头服务器必须）
-export MUJOCO_GL="egl"
-export PYOPENGL_PLATFORM="egl"
+# 设置 Headless 渲染环境变量（使用 OSMesa 作为备用方案）
+export MUJOCO_GL="osmesa"
+export PYOPENGL_PLATFORM="osmesa"
 
 # 使用 accelerate launch 启动多 GPU 训练
 accelerate launch \
@@ -106,9 +106,7 @@ accelerate launch \
     --output_dir="${OUTPUT_DIR}" \
     --steps="${STEPS}" \
     --batch_size="${BATCH_SIZE_PER_GPU}" \
-    --eval_freq=1000000 \
-    --eval.n_episodes=1 \
-    --eval.batch_size=1 \
+    --eval_freq=0 \
     --save_freq="${SAVE_FREQ}" \
     --log_freq="${LOG_FREQ}" \
     --seed="${SEED}" \

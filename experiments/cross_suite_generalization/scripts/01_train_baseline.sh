@@ -51,9 +51,9 @@ fi
 echo "开始训练 Baseline..."
 echo ""
 
-# 设置 Headless 渲染环境变量（无头服务器必须）
-export MUJOCO_GL="egl"
-export PYOPENGL_PLATFORM="egl"
+# 设置 Headless 渲染环境变量（使用 OSMesa 作为备用方案）
+export MUJOCO_GL="osmesa"
+export PYOPENGL_PLATFORM="osmesa"
 
 python -m lerobot.scripts.lerobot_train \
     --policy.path="${POLICY_PATH}" \
@@ -66,9 +66,7 @@ python -m lerobot.scripts.lerobot_train \
     --output_dir="${OUTPUT_DIR}" \
     --steps="${STEPS}" \
     --batch_size="${BATCH_SIZE}" \
-    --eval_freq=1000000 \
-    --eval.n_episodes=1 \
-    --eval.batch_size=1 \
+    --eval_freq=0 \
     --save_freq="${SAVE_FREQ}" \
     --log_freq="${LOG_FREQ}" \
     --seed="${SEED}" \
