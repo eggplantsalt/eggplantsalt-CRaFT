@@ -53,6 +53,8 @@ echo ""
 python -m lerobot.scripts.build_anchor_hidden_cache \
     --teacher_policy_path="${TEACHER_POLICY_PATH}" \
     --dataset_repo_id="${DATASET_REPO_ID}" \
+    --dataset.use_imagenet_stats=false \
+    --rename_map '{"observation.images.agentview_rgb": "observation.images.image", "observation.images.eye_in_hand_rgb": "observation.images.image2"}' \
     --output_dir="${OUTPUT_DIR}" \
     --num_samples="${NUM_SAMPLES}" \
     --hidden_layer="${HIDDEN_LAYER}" \
