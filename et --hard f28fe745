@@ -1,0 +1,30 @@
+* [33m789ed1f0[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m, [m[1;31morigin/main[m[33m, [m[1;31morigin/HEAD[m[33m)[m renamemap
+* [33mee805096[m renamemap
+* [33mf28fe745[m ffmpeg
+* [33mc9e4afa0[m egl
+* [33mdbea77dd[m wgjy
+* [33me9227b2a[m renamemap
+* [33m262b1954[m renamemap
+* [33m755bb482[m renamemap
+* [33mfa3bd586[m renamemap
+* [33m129bb5e8[m wgjy
+* [33m4782ccef[m 禁止推送hgfc
+* [33m85b09c5a[m multigpu
+* [33m6f8e0cdc[m xiaoshiyan
+* [33m14ae6ebc[m docs: add final documentation report
+* [33m16d9cb2c[m docs: add documentation index for quick navigation
+* [33m45080a4a[m docs: add project directory guide and restructure summary
+* [33m0960c83b[m docs: complete documentation restructure and rewrite
+* [33mb19d89cd[m docs: add MCQ evaluation summary
+* [33mad3f4dce[m feat: add MCQ likelihood eval script for pi0_fast
+* [33me0369d7a[m docs: add phase 4 integration report and summary
+* [33maf8a8b48[m feat: integrate hidden retention into craft training loop
+* [33m4684ec00[m feat: hidden-state retention loss implementation + tests
+* [33m9782dbef[m feat: add offline hidden anchor cache builder + loader
+* [33mc609532e[m fix: ensure craft anchor loading works; correct grad conflict logging
+* [33mf0886855[m docs: reorganize files into structured folders
+* [33mcbb352cb[m docs: add FINAL_REPORT.md summarizing CRaFT hidden-state anchoring implementation and results
+* [33m9e78dc83[m feat: switch retention to hidden-state anchoring (offline teacher cache)
+* [33ma6ef2bb2[m docs: add CRaFT integration summary
+* [33m2e962279[m feat: integrate CRaFT into pi0_fast training (anchor cache, K-step, distributed lambda)
+* [33mb69c742a[m docs: update AnchorCache implementation details and usage examples
