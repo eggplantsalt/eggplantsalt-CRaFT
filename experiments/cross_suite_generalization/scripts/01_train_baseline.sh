@@ -1,0 +1,85 @@
+#!/bin/bash
+
+################################################################################
+# 步骤 1: 训练 Baseline (Naive SFT)
+################################################################################
+#
+# 在 libero_spatial 上进行标准微调，不使用任何 CRaFT 约束
+#
+################################################################################
+
+set -e
+
+echo "=========================================="
+echo "训练 Baseline (Naive SFT)"
+echo "=========================================="
+
+# 配置参数
+POLICY_PATH="lerobot/pi0_fast"
+ENV_TYPE="libero"
+ENV_TASK="libero_spatial"
+DATASET_REPO_ID="lerobot/libero_spatial_no_noops"
+OUTPUT_DIR="experiments/cross_suite_generalization/outputs/baseline_spatial"
+STEPS=10000
+BATCH_SIZE=32
+EVAL_FREQ=2000
+SAVE_FREQ=2000
+LOG_FREQ=100
+SEED=42
+
+echo "配置信息："
+echo "  Policy: ${POLICY_PATH}"
+echo "  Environment: ${ENV_TYPE} / ${ENV_TASK}"
+echo "  Dataset: ${DATASET_REPO_ID}"
+echo "  Output: ${OUTPUT_DIR}"
+echo "  Steps: ${STEPS}"
+echo "  Batch Size: ${BATCH_SIZE}"
+echo ""
+
+# 检查输出目录
+if [ -d "${OUTPUT_DIR}/checkpoints/010000" ]; then
+    echo "警告: 检测到已存在的 checkpoint，将覆盖"
+    read -p "是否继续? (y/n) " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        echo "取消训练"
+        exit 1
+    fi
+fi
+
+# 开始训练
+echo "开始训练 Baseline..."
+echo ""
+
+python -m lerobot.scripts.lerobot_train \
+    --policy.path="${POLICY_PATH}" \
+    --env.type="${ENV_TYPE}" \
+    --env.task="${ENV_TASK}" \
+    --dataset.repo_id="${DATASET_REPO_ID}" \
+    --output_dir="${OUTPUT_DIR}" \
+    --steps="${STEPS}" \
+    --batch_size="${BATCH_SIZE}" \
+    --eval_freq="${EVAL_FREQ}" \
+    --save_freq="${SAVE_FREQ}" \
+    --log_freq="${LOG_FREQ}" \
+    --seed="${SEED}" \
+    --num_workers=4 \
+    --save_checkpoint=true
+
+echo ""
+echo "=========================================="
+echo "Baseline 训练完成！"
+echo "=========================================="
+echo ""
+echo "Checkpoint 位置: ${OUTPUT_DIR}/checkpoints/010000/"
+echo ""
+
+# 验证 checkpoint 存在
+if [ ! -d "${OUTPUT_DIR}/checkpoints/010000/pretrained_model" ]; then
+    echo "错误: Checkpoint 未找到"
+    exit 1
+fi
+
+echo "✓ Checkpoint 验证通过"
+echo ""
+

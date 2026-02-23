@@ -1,0 +1,71 @@
+# CRaFT 训练配置
+# 使用 CRaFT 约束在 libero_spatial 上微调
+
+policy:
+  path: lerobot/pi0_fast
+  device: cuda
+  use_amp: false
+
+env:
+  type: libero
+  task: libero_spatial
+
+dataset:
+  repo_id: lerobot/libero_spatial_no_noops
+
+# 训练参数
+output_dir: experiments/cross_suite_generalization/outputs/craft_spatial
+steps: 10000
+batch_size: 32
+num_workers: 4
+seed: 42
+
+# 评估和保存
+eval_freq: 2000
+save_freq: 2000
+log_freq: 100
+save_checkpoint: true
+
+# 优化器
+optimizer:
+  type: adamw
+  lr: 1.0e-5
+  weight_decay: 0.01
+
+# 学习率调度器
+scheduler:
+  type: cosine
+  warmup_steps: 500
+
+# CRaFT 配置
+craft:
+  enabled: true
+  anchor_cache_dir: experiments/cross_suite_generalization/outputs/anchor_cache
+  
+  # 保留损失配置
+  retention_freq: 5  # 每 5 步计算一次保留损失
+  retention_mode: hidden  # 使用 hidden state retention
+  
+  # 原对偶优化
+  initial_lambda: 1.0  # 初始 Lagrangian 乘子
+  lambda_lr: 0.001  # λ 更新学习率
+  lambda_max: 10.0  # λ 最大值
+  
+  # 保留约束（退火）
+  epsilon_start: 1.0  # 初始约束阈值
+  epsilon_end: 0.05  # 最终约束阈值
+  epsilon_anneal_steps: 8000  # 退火步数
+  
+  # 梯度手术
+  use_grad_projection: true  # 启用梯度投影
+  conflict_threshold: -0.1  # 冲突检测阈值（cos < -0.1 视为冲突）
+  
+  # 锚点批次
+  anchor_batch_size: 16  # 锚点数据批次大小
+  
+  # 日志
+  log_retention_loss: true
+  log_lambda: true
+  log_epsilon: true
+  log_grad_conflict: true
+

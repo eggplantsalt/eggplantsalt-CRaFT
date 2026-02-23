@@ -23,6 +23,7 @@
 | [快速开始](QUICKSTART.md) | 5 分钟上手教程 | 所有用户 |
 | [实验指南](EXPERIMENT_GUIDE.md) | 完整实验操作步骤 | 研究人员 |
 | [CRaFT 训练指南](craft/CRAFT_TRAINING_GUIDE.md) | CRaFT 训练详解 | 高级用户 |
+| [原始 LeRobot 教程](original_lerobot/PI0FAST_LIBERO_EVAL.md) | 不使用 CRaFT 的评测流程 | 研究人员 |
 | [故障排查](TROUBLESHOOTING.md) | 常见问题解决 | 所有用户 |
 
 ### 技术文档

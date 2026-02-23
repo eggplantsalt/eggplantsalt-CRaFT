@@ -1,0 +1,39 @@
+# Baseline 训练配置
+# 标准的 Pi0-fast 微调，不使用任何 CRaFT 约束
+
+policy:
+  path: lerobot/pi0_fast
+  device: cuda
+  use_amp: false
+
+env:
+  type: libero
+  task: libero_spatial
+
+dataset:
+  repo_id: lerobot/libero_spatial_no_noops
+
+# 训练参数
+output_dir: experiments/cross_suite_generalization/outputs/baseline_spatial
+steps: 10000
+batch_size: 32
+num_workers: 4
+seed: 42
+
+# 评估和保存
+eval_freq: 2000
+save_freq: 2000
+log_freq: 100
+save_checkpoint: true
+
+# 优化器
+optimizer:
+  type: adamw
+  lr: 1.0e-5
+  weight_decay: 0.01
+
+# 学习率调度器
+scheduler:
+  type: cosine
+  warmup_steps: 500
+
