@@ -13,6 +13,7 @@ env:
 
 dataset:
   repo_id: lerobot/libero  # 使用全量数据集，通过 env.task 自动过滤
+  use_imagenet_stats: false  # 禁用 ImageNet 统计信息覆盖
 
 # 训练参数
 output_dir: experiments/cross_suite_generalization/outputs/baseline_spatial
