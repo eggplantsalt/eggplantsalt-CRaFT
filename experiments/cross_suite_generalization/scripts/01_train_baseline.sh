@@ -65,8 +65,7 @@ python -m lerobot.scripts.lerobot_train \
     --log_freq="${LOG_FREQ}" \
     --seed="${SEED}" \
     --num_workers=4 \
-    --save_checkpoint=true \
-    --rename_map '{"observation.images.agentview_rgb": "observation.images.image", "observation.images.eye_in_hand_rgb": "observation.images.image2"}'
+    --save_checkpoint=true
 
 echo ""
 echo "=========================================="

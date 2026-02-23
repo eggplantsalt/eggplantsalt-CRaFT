@@ -15,6 +15,11 @@ dataset:
   repo_id: lerobot/libero  # 使用全量数据集，通过 env.task 自动过滤
   use_imagenet_stats: false  # 禁用 ImageNet 统计信息覆盖
 
+# 键名映射：将 LIBERO 数据集的相机键名映射到 Pi0Fast 期望的键名
+rename_map:
+  observation.images.agentview_rgb: observation.images.image
+  observation.images.eye_in_hand_rgb: observation.images.image2
+
 # 训练参数
 output_dir: experiments/cross_suite_generalization/outputs/baseline_spatial
 steps: 10000
