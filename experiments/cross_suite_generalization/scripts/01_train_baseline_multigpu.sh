@@ -22,7 +22,6 @@ ENV_TASK="libero_spatial"  # 通过 env.task 过滤数据集
 DATASET_REPO_ID="lerobot/libero"  # 使用全量数据集，通过 env.task 自动过滤
 OUTPUT_DIR="experiments/cross_suite_generalization/outputs/baseline_spatial"
 STEPS=10000
-EVAL_FREQ=2000
 SAVE_FREQ=2000
 LOG_FREQ=100
 SEED=42
@@ -39,6 +38,7 @@ echo "  Dataset: ${DATASET_REPO_ID}"
 echo "  Output: ${OUTPUT_DIR}"
 echo "  Steps: ${STEPS}"
 echo "  Total Batch Size: ${TOTAL_BATCH_SIZE} (${NUM_GPUS} GPUs × ${BATCH_SIZE_PER_GPU})"
+echo "  注意: 训练期间禁用在线评估（避免 Headless 服务器卡死）"
 echo ""
 
 # 检查输出目录
@@ -87,6 +87,10 @@ fi
 echo "开始训练 Baseline (使用 ${NUM_GPUS} 个 GPU)..."
 echo ""
 
+# 设置 Headless 渲染环境变量（无头服务器必须）
+export MUJOCO_GL="egl"
+export PYOPENGL_PLATFORM="egl"
+
 # 使用 accelerate launch 启动多 GPU 训练
 accelerate launch \
     --num_processes=${NUM_GPUS} \
@@ -102,7 +106,9 @@ accelerate launch \
     --output_dir="${OUTPUT_DIR}" \
     --steps="${STEPS}" \
     --batch_size="${BATCH_SIZE_PER_GPU}" \
-    --eval_freq="${EVAL_FREQ}" \
+    --eval_freq=1000000 \
+    --eval.n_episodes=1 \
+    --eval.batch_size=1 \
     --save_freq="${SAVE_FREQ}" \
     --log_freq="${LOG_FREQ}" \
     --seed="${SEED}" \

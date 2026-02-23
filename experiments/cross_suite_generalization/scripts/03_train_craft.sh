@@ -23,7 +23,6 @@ OUTPUT_DIR="experiments/cross_suite_generalization/outputs/craft_spatial"
 ANCHOR_CACHE_DIR="experiments/cross_suite_generalization/outputs/anchor_cache"
 STEPS=10000
 BATCH_SIZE=32
-EVAL_FREQ=2000
 SAVE_FREQ=2000
 LOG_FREQ=100
 SEED=42
@@ -46,6 +45,7 @@ echo "  Output: ${OUTPUT_DIR}"
 echo "  Anchor Cache: ${ANCHOR_CACHE_DIR}"
 echo "  Steps: ${STEPS}"
 echo "  Batch Size: ${BATCH_SIZE}"
+echo "  注意: 训练期间禁用在线评估（避免 Headless 服务器卡死）"
 echo ""
 echo "CRaFT 超参数："
 echo "  Enabled: ${CRAFT_ENABLED}"
@@ -77,6 +77,10 @@ fi
 echo "开始训练 CRaFT..."
 echo ""
 
+# 设置 Headless 渲染环境变量（无头服务器必须）
+export MUJOCO_GL="egl"
+export PYOPENGL_PLATFORM="egl"
+
 python -m lerobot.scripts.lerobot_train_craft \
     --policy.path="${POLICY_PATH}" \
     --policy.repo_id="local/pi0fast_craft" \
@@ -88,7 +92,9 @@ python -m lerobot.scripts.lerobot_train_craft \
     --output_dir="${OUTPUT_DIR}" \
     --steps="${STEPS}" \
     --batch_size="${BATCH_SIZE}" \
-    --eval_freq="${EVAL_FREQ}" \
+    --eval_freq=1000000 \
+    --eval.n_episodes=1 \
+    --eval.batch_size=1 \
     --save_freq="${SAVE_FREQ}" \
     --log_freq="${LOG_FREQ}" \
     --seed="${SEED}" \
