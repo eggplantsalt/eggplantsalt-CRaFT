@@ -15,8 +15,8 @@ echo "构建 Anchor Cache"
 echo "=========================================="
 
 # 配置参数
-TEACHER_POLICY_PATH="lerobot/pi0_fast"
-DATASET_REPO_ID="lerobot/libero_spatial_no_noops"
+TEACHER_POLICY_PATH="lerobot/pi0fast-base"  # 官方预训练模型
+DATASET_REPO_ID="lerobot/libero"  # 使用全量数据集
 OUTPUT_DIR="experiments/cross_suite_generalization/outputs/anchor_cache"
 NUM_SAMPLES=1000
 HIDDEN_LAYER=-2

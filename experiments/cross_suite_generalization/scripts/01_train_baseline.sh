@@ -15,10 +15,10 @@ echo "训练 Baseline (Naive SFT)"
 echo "=========================================="
 
 # 配置参数
-POLICY_PATH="lerobot/pi0_fast"
+POLICY_PATH="lerobot/pi0fast-base"  # 官方预训练模型
 ENV_TYPE="libero"
-ENV_TASK="libero_spatial"
-DATASET_REPO_ID="lerobot/libero_spatial_no_noops"
+ENV_TASK="libero_spatial"  # 通过 env.task 过滤数据集
+DATASET_REPO_ID="lerobot/libero"  # 使用全量数据集，通过 env.task 自动过滤
 OUTPUT_DIR="experiments/cross_suite_generalization/outputs/baseline_spatial"
 STEPS=10000
 BATCH_SIZE=32

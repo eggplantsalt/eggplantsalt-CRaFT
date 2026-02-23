@@ -2,16 +2,16 @@
 # 标准的 Pi0-fast 微调，不使用任何 CRaFT 约束
 
 policy:
-  path: lerobot/pi0_fast
+  path: lerobot/pi0fast-base  # 官方预训练模型
   device: cuda
   use_amp: false
 
 env:
   type: libero
-  task: libero_spatial
+  task: libero_spatial  # 通过 env.task 过滤数据集
 
 dataset:
-  repo_id: lerobot/libero_spatial_no_noops
+  repo_id: lerobot/libero  # 使用全量数据集，通过 env.task 自动过滤
 
 # 训练参数
 output_dir: experiments/cross_suite_generalization/outputs/baseline_spatial
